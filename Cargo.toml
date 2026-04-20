@@ -1,0 +1,30 @@
+[package]
+name = "pdft"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
+hayro = "0.6.0"
+kurbo = "0.13"
+image = "0.25"
+lopdf = "0.36"
+lru = "0.13"
+ratatui = "0.29"
+ratatui-image = { version = "8", features = ["crossterm"] }
+
+# Optimize heavy rendering deps even in debug builds
+[profile.dev.package.hayro]
+opt-level = 3
+[profile.dev.package.hayro-interpret]
+opt-level = 3
+[profile.dev.package.hayro-syntax]
+opt-level = 3
+[profile.dev.package.vello_cpu]
+opt-level = 3
+[profile.dev.package.vello_common]
+opt-level = 3
+[profile.dev.package.image]
+opt-level = 2

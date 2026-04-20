@@ -1,0 +1,659 @@
+use crate::app::{App, LayoutMode, ViewMode};
+use crate::render::cache::ImageCache;
+use crate::render::renderer;
+use crate::render::text_layout;
+use crate::tui::input;
+use crate::tui::views::{dialog, dialog::InputDialog, help, page_view, sidebar, status_bar, thumbnail_bar};
+use anyhow::Result;
+use crossterm::event::{self, Event};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use crossterm::execute;
+use hayro::RenderCache;
+use hayro::hayro_syntax::Pdf;
+use page_view::PageViewState;
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui_image::picker::Picker;
+use std::io;
+use std::path::Path;
+use std::time::Duration;
+use thumbnail_bar::ThumbnailBarState;
+
+/// Holds hayro PDFs for rendering.
+struct PdfStore {
+    pdfs: Vec<Pdf>,
+}
+
+impl PdfStore {
+    fn new() -> Self {
+        Self { pdfs: Vec::new() }
+    }
+
+    fn load(&mut self, path: &Path) -> Result<()> {
+        let bytes = std::fs::read(path)?;
+        let pdf = Pdf::new(bytes)
+            .map_err(|e| anyhow::anyhow!("failed to parse PDF: {e:?}"))?;
+        self.pdfs.push(pdf);
+        Ok(())
+    }
+
+    fn get(&self, doc_id: usize) -> Option<&Pdf> {
+        self.pdfs.get(doc_id)
+    }
+}
+
+/// Max thumbnails to render per event loop tick to stay responsive.
+const THUMB_BATCH_SIZE: usize = 3;
+
+/// Launch the TUI for viewing a PDF file.
+pub fn run(path: &Path) -> Result<()> {
+    let picker = Picker::from_query_stdio()
+        .unwrap_or_else(|_| Picker::from_fontsize((8, 16)));
+
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, crossterm::event::EnableMouseCapture)?;
+
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut app = App::new();
+    app.open_file(path)?;
+
+    let mut pdf_store = PdfStore::new();
+    pdf_store.load(path)?;
+
+    let mut page_state = PageViewState::new();
+    let mut thumb_state = ThumbnailBarState::new();
+    let mut input_dialog = InputDialog::new("", "");
+    let mut image_cache = ImageCache::new(32);
+
+    let font_size = picker.font_size();
+    let sz = terminal.size()?;
+    let term_rect = Rect::new(0, 0, sz.width, sz.height);
+
+    render_current_page(&pdf_store, &app, &picker, &mut page_state, &mut image_cache, term_rect, font_size);
+    render_nearby_thumbnails(&pdf_store, &app, &mut thumb_state, font_size, term_rect, THUMB_BATCH_SIZE);
+
+    let result = run_loop(
+        &mut terminal,
+        &mut app,
+        &mut pdf_store,
+        &picker,
+        &mut page_state,
+        &mut thumb_state,
+        &mut input_dialog,
+        &mut image_cache,
+    );
+
+    // Drop all protocol/image state BEFORE restoring the terminal.
+    // Protocol destructors may write escape sequences; they must go
+    // to the alternate screen, not the user's shell.
+    drop(page_state);
+    drop(thumb_state);
+    drop(image_cache);
+
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        crossterm::event::DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
+    terminal.show_cursor()?;
+
+    result
+}
+
+fn run_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    pdf_store: &mut PdfStore,
+    picker: &Picker,
+    page_state: &mut PageViewState,
+    thumb_state: &mut ThumbnailBarState,
+    input_dialog: &mut InputDialog,
+    image_cache: &mut ImageCache,
+) -> Result<()> {
+    let font_size = picker.font_size();
+
+    loop {
+        let sz = terminal.size()?;
+        let term_size = Rect::new(0, 0, sz.width, sz.height);
+
+        terminal.draw(|f| {
+            let show_main = app.layout_mode != LayoutMode::ThumbnailsOnly;
+            let show_thumbs = app.layout_mode != LayoutMode::NoThumbnails;
+
+            let mut constraints = vec![Constraint::Length(1)]; // status bar
+            if show_main {
+                constraints.push(Constraint::Min(5)); // main area
+            }
+            if show_thumbs {
+                constraints.push(if show_main {
+                    Constraint::Length(8)
+                } else {
+                    Constraint::Min(5)
+                });
+            }
+            constraints.push(Constraint::Length(1)); // command hints
+
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(constraints)
+                .split(f.area());
+
+            let mut chunk_idx = 0;
+
+            // Status bar
+            status_bar::render(f, chunks[chunk_idx], app);
+            chunk_idx += 1;
+
+            // Main area (with sidebar)
+            if show_main {
+                let main_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Length(12),
+                        Constraint::Min(20),
+                    ])
+                    .split(chunks[chunk_idx]);
+
+                sidebar::render(f, main_chunks[0], app);
+                page_view::render(f, main_chunks[1], app, page_state);
+                chunk_idx += 1;
+            }
+
+            // Thumbnail strip or grid (with sidebar in grid mode)
+            if show_thumbs {
+                if show_main {
+                    thumbnail_bar::render(f, chunks[chunk_idx], app, thumb_state, picker);
+                } else {
+                    // Grid mode: sidebar + thumbnail grid
+                    let grid_chunks = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([
+                            Constraint::Length(12),
+                            Constraint::Min(20),
+                        ])
+                        .split(chunks[chunk_idx]);
+
+                    sidebar::render(f, grid_chunks[0], app);
+                    thumbnail_bar::render_grid(f, grid_chunks[1], app, thumb_state, picker);
+                }
+                chunk_idx += 1;
+            }
+
+            // Bottom bar: dialog, pending assign prompt, or command hints
+            if input_dialog.active {
+                dialog::render(f, chunks[chunk_idx], input_dialog);
+            } else if app.pending_assign {
+                let line = ratatui::text::Line::from(vec![
+                    ratatui::text::Span::styled(" Assign to group: ", crate::tui::theme::HELP_KEY),
+                    ratatui::text::Span::raw("press a-z"),
+                ]);
+                f.render_widget(ratatui::widgets::Paragraph::new(line), chunks[chunk_idx]);
+            } else if app.visual_anchor.is_some() {
+                let (a, b) = app.selected_range();
+                let count = b - a + 1;
+                let line = ratatui::text::Line::from(vec![
+                    ratatui::text::Span::styled(" VISUAL ", ratatui::style::Style::default()
+                        .fg(ratatui::style::Color::Black)
+                        .bg(ratatui::style::Color::Cyan)),
+                    ratatui::text::Span::raw(format!(" {count} page(s) selected  ")),
+                    ratatui::text::Span::styled("d", crate::tui::theme::HELP_KEY),
+                    ratatui::text::Span::raw(":del  "),
+                    ratatui::text::Span::styled("a+key", crate::tui::theme::HELP_KEY),
+                    ratatui::text::Span::raw(":group  "),
+                    ratatui::text::Span::styled("Esc", crate::tui::theme::HELP_KEY),
+                    ratatui::text::Span::raw(":cancel"),
+                ]);
+                f.render_widget(ratatui::widgets::Paragraph::new(line), chunks[chunk_idx]);
+            } else {
+                let hints = ratatui::text::Line::from(vec![
+                    ratatui::text::Span::styled(" j/k", crate::tui::theme::HELP_KEY),
+                    ratatui::text::Span::raw(":nav  "),
+                    ratatui::text::Span::styled("v", crate::tui::theme::HELP_KEY),
+                    ratatui::text::Span::raw(":select  "),
+                    ratatui::text::Span::styled("d", crate::tui::theme::HELP_KEY),
+                    ratatui::text::Span::raw(":del  "),
+                    ratatui::text::Span::styled("a", crate::tui::theme::HELP_KEY),
+                    ratatui::text::Span::raw(":assign  "),
+                    ratatui::text::Span::styled("s", crate::tui::theme::HELP_KEY),
+                    ratatui::text::Span::raw(":save  "),
+                    ratatui::text::Span::styled("/", crate::tui::theme::HELP_KEY),
+                    ratatui::text::Span::raw(":search  "),
+                    ratatui::text::Span::styled("?", crate::tui::theme::HELP_KEY),
+                    ratatui::text::Span::raw(":help  "),
+                    ratatui::text::Span::styled("q", crate::tui::theme::HELP_KEY),
+                    ratatui::text::Span::raw(":quit"),
+                ]);
+                f.render_widget(ratatui::widgets::Paragraph::new(hints), chunks[chunk_idx]);
+            }
+
+            if app.show_help {
+                help::render(f, f.area());
+            }
+        })?;
+
+        if app.should_quit {
+            break;
+        }
+
+        // Incrementally render thumbnails that are still missing.
+        // This runs every tick even without key events, progressively filling in.
+        let rendered_any = if app.layout_mode != LayoutMode::NoThumbnails {
+            render_nearby_thumbnails(
+                pdf_store, app, thumb_state, font_size, term_size, THUMB_BATCH_SIZE,
+            )
+        } else {
+            false
+        };
+
+        // Use shorter poll when thumbnails are still loading so we redraw quickly
+        let poll_ms = if rendered_any { 10 } else { 100 };
+
+        if event::poll(Duration::from_millis(poll_ms))? {
+            // Read the event and drain any queued duplicates (debounce).
+            // This prevents key-repeat from queueing up many page turns
+            // that continue after the key is released.
+            let mut key_event = None;
+            if let Event::Key(key) = event::read()? {
+                key_event = Some(key);
+                // Drain queued events, keeping only the last key event
+                while event::poll(Duration::from_millis(0))? {
+                    if let Event::Key(next_key) = event::read()? {
+                        key_event = Some(next_key);
+                    }
+                }
+            }
+            if let Some(key) = key_event {
+                let prev_page = app.current_page();
+                let prev_page_count = app.page_count();
+                let prev_doc_count = app.workspace.documents.len();
+                let prev_history_len = app.workspace.history.len();
+                let prev_layout = app.layout_mode;
+                let prev_view_mode = app.view_mode;
+                let had_help = app.show_help;
+                let had_dialog = input_dialog.active;
+
+                input::handle_key(app, key, input_dialog);
+
+                // New document merged
+                if app.workspace.documents.len() > prev_doc_count {
+                    for i in prev_doc_count..app.workspace.documents.len() {
+                        let path = app.workspace.documents[i].path.clone();
+                        if let Err(e) = pdf_store.load(&path) {
+                            app.status_message = Some(format!("Render load error: {e}"));
+                        }
+                    }
+                    thumb_state.clear();
+                    image_cache.clear();
+                }
+
+                // Execute pending search
+                let needs_search = app
+                    .search
+                    .as_ref()
+                    .is_some_and(|s| s.matches.is_empty() && !s.query.is_empty());
+                if needs_search {
+                    let page_count = app.page_count();
+                    let mut search = app.search.take().unwrap();
+                    execute_search(pdf_store, page_count, &app.workspace, &mut search);
+                    if search.matches.is_empty() {
+                        app.status_message = Some(format!("No matches for '{}'", search.query));
+                    } else {
+                        let cur = app.current_page();
+                        let idx = search
+                            .matches
+                            .iter()
+                            .position(|(p, _)| *p >= cur)
+                            .unwrap_or(0);
+                        search.current_match = idx;
+                        let (page_idx, _) = search.matches[idx];
+                        app.workspace.selected_page = page_idx;
+                        let total = search.matches.len();
+                        app.status_message =
+                            Some(format!("Match {}/{total} for '{}'", idx + 1, search.query));
+                    }
+                    app.search = Some(search);
+                }
+
+                let layout_changed = app.layout_mode != prev_layout;
+                let overlay_dismissed = (had_help && !app.show_help)
+                    || (had_dialog && !input_dialog.active);
+
+                // Full terminal clear for graphics protocol artifacts
+                if layout_changed || overlay_dismissed {
+                    page_state.rendered_page = None;
+                    let _ = terminal.clear();
+                }
+
+                // Page count changed (e.g. undo of merge) — refresh thumbnails
+                let page_count_changed = app.page_count() != prev_page_count;
+                if page_count_changed {
+                    thumb_state.clear();
+                    image_cache.clear();
+                }
+
+                let state_changed = app.workspace.history.len() != prev_history_len;
+
+                let view_mode_changed = app.view_mode != prev_view_mode;
+
+                let needs_rerender = app.current_page() != prev_page
+                    || app.workspace.documents.len() > prev_doc_count
+                    || layout_changed
+                    || overlay_dismissed
+                    || page_count_changed
+                    || state_changed
+                    || view_mode_changed;
+
+                if needs_rerender {
+                    // Reset text scroll when page changes
+                    if app.current_page() != prev_page {
+                        page_state.text_scroll = 0;
+                    }
+
+                    // Only render the main page if it's actually visible
+                    if app.layout_mode != LayoutMode::ThumbnailsOnly {
+                        page_state.rendered_page = None;
+                        render_current_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
+                    }
+
+                    // Extract text if in text mode and page changed
+                    if app.view_mode == ViewMode::Text
+                        && app.layout_mode != LayoutMode::ThumbnailsOnly
+                    {
+                        extract_current_text(pdf_store, app, page_state, term_size);
+                    }
+                    // Only render thumbnails if visible and some are missing
+                    if app.layout_mode != LayoutMode::NoThumbnails {
+                        render_nearby_thumbnails(pdf_store, app, thumb_state, font_size, term_size, THUMB_BATCH_SIZE);
+                    }
+
+                    // Update search match positions for current page
+                    if app.current_page() != prev_page || needs_search {
+                        update_match_positions(pdf_store, app);
+                    }
+                }
+
+                // Apply text scroll delta
+                let delta = app.text_scroll_delta;
+                if delta != 0 {
+                    app.text_scroll_delta = 0;
+                    let visible_rows = term_size.height.saturating_sub(12);
+                    if delta == i16::MAX {
+                        page_state.scroll_down(u16::MAX / 2, visible_rows);
+                    } else if delta == i16::MIN {
+                        page_state.text_scroll = 0;
+                    } else if delta > 0 {
+                        page_state.scroll_down(delta as u16, visible_rows);
+                    } else {
+                        page_state.scroll_up((-delta) as u16);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Compute pixel dimensions from a terminal cell area and font size.
+fn area_to_pixels(area: Rect, font_size: (u16, u16)) -> (u16, u16) {
+    let (fw, fh) = font_size;
+    (
+        area.width.saturating_mul(fw).max(1),
+        area.height.saturating_mul(fh).max(1),
+    )
+}
+
+fn render_current_page(
+    store: &PdfStore,
+    app: &App,
+    picker: &Picker,
+    page_state: &mut PageViewState,
+    image_cache: &mut ImageCache,
+    term_size: Rect,
+    font_size: (u16, u16),
+) {
+    let page_idx = app.current_page();
+    if page_state.rendered_page == Some(page_idx) {
+        return;
+    }
+
+    let slot = match app.workspace.pages.get(page_idx) {
+        Some(s) => s,
+        None => return,
+    };
+    let doc_id = slot.source.doc_id;
+    let page_num = slot.source.page_num;
+
+    // Compute target resolution based on current layout
+    let (view_cols, view_rows) = match app.layout_mode {
+        LayoutMode::NoThumbnails => (
+            term_size.width.saturating_sub(14),
+            term_size.height.saturating_sub(3), // status + hints
+        ),
+        _ => (
+            term_size.width.saturating_sub(14),
+            term_size.height.saturating_sub(11), // status + thumbs + hints
+        ),
+    };
+    let (max_w, max_h) = area_to_pixels(
+        Rect::new(0, 0, view_cols, view_rows),
+        font_size,
+    );
+
+    // Check image cache (includes resolution in key)
+    if let Some(cached) = image_cache.get(doc_id, page_num, max_w, max_h) {
+        page_state.image_size = Some((cached.width(), cached.height()));
+        let proto = picker.new_resize_protocol(cached.clone());
+        page_state.protocol = Some(proto);
+        page_state.rendered_page = Some(page_idx);
+        return;
+    }
+
+    let pdf = match store.get(doc_id) {
+        Some(p) => p,
+        None => return,
+    };
+
+    let cache = RenderCache::new();
+    match renderer::render_page_with_cache(pdf, page_num, 2.0, Some(max_w), Some(max_h), &cache) {
+        Ok(image) => {
+            page_state.image_size = Some((image.width(), image.height()));
+            let proto = picker.new_resize_protocol(image.clone());
+            image_cache.put(doc_id, page_num, max_w, max_h, image);
+            page_state.protocol = Some(proto);
+            page_state.rendered_page = Some(page_idx);
+        }
+        Err(_) => {
+            page_state.protocol = None;
+            page_state.image_size = None;
+            page_state.rendered_page = None;
+        }
+    }
+}
+
+/// Render up to `batch_size` missing nearby thumbnails.
+/// Returns true if any were rendered (caller should redraw soon).
+fn render_nearby_thumbnails(
+    store: &PdfStore,
+    app: &App,
+    thumb_state: &mut ThumbnailBarState,
+    font_size: (u16, u16),
+    term_size: Rect,
+    batch_size: usize,
+) -> bool {
+    let page_count = app.page_count();
+    thumb_state.ensure_capacity(page_count);
+
+    let current = app.current_page();
+
+    // Compute visible range based on layout mode
+    let (start, end) = visible_thumb_range(app, current, page_count, term_size);
+
+    // Thumbnail area is ~8 rows tall
+    let (_, max_th) = area_to_pixels(Rect::new(0, 0, 20, 8), font_size);
+
+    let mut rendered = 0;
+
+    // Render thumbnails grouped by doc_id to share hayro cache
+    for doc_id in 0..store.pdfs.len() {
+        if rendered >= batch_size {
+            break;
+        }
+        let pdf = &store.pdfs[doc_id];
+        let cache = RenderCache::new();
+
+        for page_idx in start..end {
+            if rendered >= batch_size {
+                break;
+            }
+            if thumb_state.images.get(page_idx).is_some_and(|t| t.is_some()) {
+                continue;
+            }
+
+            let slot = match app.workspace.pages.get(page_idx) {
+                Some(s) if s.source.doc_id == doc_id => s,
+                _ => continue,
+            };
+
+            if let Ok(image) = renderer::render_page_with_cache(
+                pdf, slot.source.page_num, 0.5, Some(max_th), Some(max_th), &cache,
+            ) {
+                if page_idx < thumb_state.images.len() {
+                    thumb_state.images[page_idx] = Some(image);
+                    rendered += 1;
+                }
+            }
+        }
+    }
+
+    rendered > 0
+}
+
+/// Execute a text search across all pages.
+fn execute_search(
+    store: &PdfStore,
+    page_count: usize,
+    workspace: &crate::model::workspace::Workspace,
+    search: &mut crate::app::SearchState,
+) {
+    let query_lower = search.query.to_lowercase();
+    search.matches.clear();
+
+    for page_idx in 0..page_count {
+        let slot = match workspace.pages.get(page_idx) {
+            Some(s) => s,
+            None => continue,
+        };
+        let pdf = match store.get(slot.source.doc_id) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        if let Ok(text) = text_layout::extract_text(pdf, slot.source.page_num) {
+            let text_lower = text.to_lowercase();
+            let count = text_lower.matches(&query_lower).count();
+            if count > 0 {
+                search.matches.push((page_idx, count));
+            }
+        }
+    }
+}
+
+/// Extract text for the current page and store in PageViewState.
+/// Update search match y-positions for the current page.
+fn update_match_positions(store: &PdfStore, app: &mut App) {
+    let query = match &app.search {
+        Some(s) if !s.query.is_empty() => s.query.clone(),
+        _ => {
+            if let Some(ref mut s) = app.search {
+                s.current_page_match_positions.clear();
+            }
+            return;
+        }
+    };
+
+    let page_idx = app.current_page();
+    let slot = match app.workspace.pages.get(page_idx) {
+        Some(s) => s,
+        None => return,
+    };
+    let pdf = match store.get(slot.source.doc_id) {
+        Some(p) => p,
+        None => return,
+    };
+
+    let positions = text_layout::find_match_positions(pdf, slot.source.page_num, &query)
+        .unwrap_or_default();
+
+    if let Some(ref mut s) = app.search {
+        s.current_page_match_positions = positions;
+    }
+}
+
+fn extract_current_text(
+    store: &PdfStore,
+    app: &App,
+    page_state: &mut PageViewState,
+    term_size: Rect,
+) {
+    let page_idx = app.current_page();
+    // Already cached for this page?
+    if let Some((cached, _)) = &page_state.text_lines {
+        if *cached == page_idx {
+            return;
+        }
+    }
+
+    let slot = match app.workspace.pages.get(page_idx) {
+        Some(s) => s,
+        None => return,
+    };
+    let pdf = match store.get(slot.source.doc_id) {
+        Some(p) => p,
+        None => return,
+    };
+
+    // Available text area: full width minus sidebar, minus status/hints rows
+    let cols = term_size.width.saturating_sub(14);
+    let rows = match app.layout_mode {
+        LayoutMode::NoThumbnails => term_size.height.saturating_sub(3),
+        _ => term_size.height.saturating_sub(11),
+    };
+
+    match text_layout::extract_text_grid(pdf, slot.source.page_num, cols, rows) {
+        Ok(lines) => {
+            page_state.text_lines = Some((page_idx, lines));
+        }
+        Err(_) => {
+            page_state.text_lines = Some((page_idx, vec!["  Failed to extract text.".into()]));
+        }
+    }
+}
+
+/// Compute the range of page indices that are visible in the thumbnail area.
+fn visible_thumb_range(app: &App, current: usize, page_count: usize, term_size: Rect) -> (usize, usize) {
+    if app.layout_mode == LayoutMode::ThumbnailsOnly {
+        let cell_h = 8u16;
+        let cell_w = ((cell_h as f32) * 1.4).ceil() as u16;
+        let grid_w = term_size.width.saturating_sub(13); // minus sidebar
+        let cols = (grid_w / (cell_w + 1)).max(1) as usize;
+        let rows = (term_size.height.saturating_sub(2) / cell_h).max(1) as usize;
+        let per_screen = cols * rows;
+        let screen_start = (current / per_screen) * per_screen;
+        let screen_end = (screen_start + per_screen).min(page_count);
+        (screen_start, screen_end)
+    } else {
+        // Strip mode: ±4 around current
+        let start = current.saturating_sub(4);
+        let end = (current + 5).min(page_count);
+        (start, end)
+    }
+}
