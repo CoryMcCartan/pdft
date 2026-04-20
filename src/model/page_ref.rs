@@ -27,6 +27,7 @@ pub type OutputTargetId = usize;
 /// A named output file for split operations.
 #[derive(Debug, Clone)]
 pub struct OutputTarget {
+    #[allow(dead_code)]
     pub path: PathBuf,
     pub label: String,
 }

@@ -71,20 +71,22 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         String::new()
     };
 
+    let filename_span = format!(" {filename} ");
+    let mode_span = format!(" {mode} ");
+    let content_len = filename_span.len() + 1 + page_info.len() + 1
+        + mode_span.len() + del_info.len() + search_info.len() + status.len();
+    let pad_len = (area.width as usize).saturating_sub(content_len);
+
     let line = Line::from(vec![
-        Span::styled(format!(" {filename} "), theme::STATUS),
+        Span::styled(filename_span, theme::STATUS),
         Span::styled("│", theme::STATUS),
         Span::styled(page_info, theme::STATUS),
         Span::styled("│", theme::STATUS),
-        Span::styled(format!(" {mode} "), theme::STATUS),
+        Span::styled(mode_span, theme::STATUS),
         Span::styled(del_info, theme::STATUS),
         Span::styled(search_info, theme::SEARCH_MATCH_PAGE),
         Span::styled(status, theme::STATUS),
-        // Pad rest
-        Span::styled(
-            " ".repeat(area.width.saturating_sub(60) as usize),
-            theme::STATUS,
-        ),
+        Span::styled(" ".repeat(pad_len), theme::STATUS),
     ]);
 
     f.render_widget(Paragraph::new(line), area);

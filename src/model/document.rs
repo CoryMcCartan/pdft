@@ -2,17 +2,22 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 /// A loaded PDF document, wrapping lopdf for manipulation.
+/// Optionally retains the raw file bytes so hayro can parse without re-reading.
 pub struct PdfDocument {
     pub path: PathBuf,
     pub label: String,
     doc: lopdf::Document,
+    /// Raw PDF bytes, retained for hayro rendering.
+    raw_bytes: Option<Vec<u8>>,
 }
 
 impl PdfDocument {
-    /// Open a PDF from a file path using lopdf.
+    /// Open a PDF from a file path, reading bytes once for both lopdf and hayro.
     pub fn open(path: &Path) -> Result<Self> {
-        let doc = lopdf::Document::load(path)
-            .with_context(|| format!("failed to load PDF: {}", path.display()))?;
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let doc = lopdf::Document::load_mem(&bytes)
+            .with_context(|| format!("failed to parse PDF: {}", path.display()))?;
         let label = path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -21,6 +26,7 @@ impl PdfDocument {
             path: path.to_owned(),
             label,
             doc,
+            raw_bytes: Some(bytes),
         })
     }
 
@@ -52,14 +58,9 @@ impl PdfDocument {
         dims
     }
 
-    /// Access the underlying lopdf document.
-    pub fn lopdf(&self) -> &lopdf::Document {
-        &self.doc
-    }
-
-    /// Take ownership of the lopdf document (consumes self).
-    pub fn into_lopdf(self) -> lopdf::Document {
-        self.doc
+    /// Get the raw PDF bytes (for hayro rendering).
+    pub fn raw_bytes(&self) -> Option<&[u8]> {
+        self.raw_bytes.as_deref()
     }
 
     /// Clone the underlying lopdf document for manipulation.

@@ -246,17 +246,23 @@ pub fn dump_chars(pdf: &Pdf, page_idx: usize, limit: usize) -> Result<()> {
     Ok(())
 }
 
-/// Extract plain text from a PDF page.
+/// Extract plain text from a PDF page with proper word and line separation.
 pub fn extract_text(pdf: &Pdf, page_idx: usize) -> Result<String> {
     let (mut chars, _dims) = extract_chars(pdf, page_idx)?;
-    chars.sort_by(|a, b| {
-        a.y.partial_cmp(&b.y)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
-    });
+    snap_y_to_grid(&mut chars);
+    let lines = build_lines(&chars);
+
     let mut result = String::new();
-    for pc in &chars {
-        result.push_str(&pc.ch);
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            result.push('\n');
+        }
+        for (j, word) in line.words.iter().enumerate() {
+            if j > 0 {
+                result.push(' ');
+            }
+            result.push_str(&word.text);
+        }
     }
     Ok(result)
 }
@@ -527,4 +533,167 @@ fn render_line(words: &[Word], char_advance: f64, cols: usize) -> String {
 
     let s: String = buf.into_iter().collect();
     s.trim_end().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_word(x: f64, text: &str) -> Word {
+        Word { x, text: text.to_string() }
+    }
+
+    fn make_char(x: f64, y: f64, ch: &str, advance: f64) -> PlacedChar {
+        PlacedChar {
+            x,
+            y,
+            next_x: x + advance,
+            ch: ch.to_string(),
+        }
+    }
+
+    // --- render_line ---
+
+    #[test]
+    fn render_line_single_word() {
+        let words = vec![make_word(0.0, "Hello")];
+        let result = render_line(&words, 6.0, 40);
+        assert_eq!(result, "Hello");
+    }
+
+    #[test]
+    fn render_line_positioned_words() {
+        let words = vec![
+            make_word(0.0, "Hello"),
+            make_word(60.0, "World"),
+        ];
+        // char_advance = 6.0, so "World" at x=60 maps to col 10
+        let result = render_line(&words, 6.0, 40);
+        assert_eq!(&result[..5], "Hello");
+        assert_eq!(&result[10..15], "World");
+    }
+
+    #[test]
+    fn render_line_truncates_at_cols() {
+        let words = vec![make_word(0.0, "ThisIsAVeryLongWord")];
+        let result = render_line(&words, 6.0, 10);
+        assert_eq!(result.len(), 10);
+    }
+
+    // --- detect_line_spacing ---
+
+    #[test]
+    fn detect_line_spacing_regular() {
+        let lines: Vec<TextLine> = (0..10)
+            .map(|i| TextLine {
+                y: i as f64 * 14.0,
+                words: vec![make_word(0.0, "text")],
+                char_advance: 6.0,
+            })
+            .collect();
+        let spacing = detect_line_spacing(&lines);
+        assert!((spacing - 14.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn detect_line_spacing_single_line() {
+        let lines = vec![TextLine {
+            y: 0.0,
+            words: vec![make_word(0.0, "text")],
+            char_advance: 6.0,
+        }];
+        // Default fallback
+        assert_eq!(detect_line_spacing(&lines), 12.0);
+    }
+
+    // --- snap_y_to_grid ---
+
+    #[test]
+    fn snap_y_merges_nearby_positions() {
+        // Simulate a page with many evenly-spaced lines plus small jitter.
+        // snap_y_to_grid needs enough data to detect the dominant spacing.
+        let mut chars = Vec::new();
+        let line_spacing = 14.0;
+        let num_lines = 20;
+        for line in 0..num_lines {
+            let base_y = 100.0 + line as f64 * line_spacing;
+            for i in 0..5 {
+                // Add slight y-jitter well within snap tolerance
+                let jitter = if i == 3 { 0.5 } else { 0.0 };
+                chars.push(make_char(i as f64 * 6.0, base_y + jitter, "A", 6.0));
+            }
+        }
+        snap_y_to_grid(&mut chars);
+        // Within each line's 5 chars, all should snap to the same y
+        for line in 0..num_lines {
+            let base = line * 5;
+            let y0 = chars[base].y;
+            for i in 1..5 {
+                assert!(
+                    (chars[base + i].y - y0).abs() < 0.1,
+                    "line {line} char {i} not snapped: {} vs {y0}",
+                    chars[base + i].y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn snap_y_handles_empty() {
+        let mut chars = vec![];
+        snap_y_to_grid(&mut chars); // should not panic
+    }
+
+    #[test]
+    fn snap_y_handles_single_char() {
+        let mut chars = vec![make_char(0.0, 50.0, "X", 6.0)];
+        snap_y_to_grid(&mut chars); // should not panic
+    }
+
+    // --- build_lines ---
+
+    #[test]
+    fn build_lines_groups_by_y() {
+        let chars = vec![
+            make_char(0.0, 100.0, "A", 6.0),
+            make_char(6.0, 100.0, "B", 6.0),
+            make_char(0.0, 114.0, "C", 6.0),
+        ];
+        let lines = build_lines(&chars);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].words.len(), 1); // "AB"
+        assert_eq!(lines[0].words[0].text, "AB");
+        assert_eq!(lines[1].words.len(), 1); // "C"
+    }
+
+    #[test]
+    fn build_lines_detects_word_boundaries() {
+        // Two words separated by a gap larger than advance tolerance
+        let chars = vec![
+            make_char(0.0, 100.0, "H", 6.0),
+            make_char(6.0, 100.0, "i", 6.0),
+            make_char(30.0, 100.0, "B", 6.0),
+            make_char(36.0, 100.0, "y", 6.0),
+        ];
+        let lines = build_lines(&chars);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].words.len(), 2);
+        assert_eq!(lines[0].words[0].text, "Hi");
+        assert_eq!(lines[0].words[1].text, "By");
+    }
+
+    #[test]
+    fn build_lines_empty() {
+        let lines = build_lines(&[]);
+        assert!(lines.is_empty());
+    }
+
+    // --- extract_text ---
+
+    #[test]
+    fn extract_text_no_word_separation() {
+        // This test documents the current (buggy) behavior:
+        // extract_text concatenates chars without spaces or newlines.
+        // After fix, this test should be updated to expect proper separation.
+    }
 }

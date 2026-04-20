@@ -5,7 +5,6 @@ pub const DELETED: Style = Style::new()
     .fg(Color::DarkGray)
     .add_modifier(Modifier::CROSSED_OUT);
 pub const NORMAL: Style = Style::new().fg(Color::White);
-pub const HEADER: Style = Style::new().fg(Color::White).bg(Color::DarkGray);
 pub const STATUS: Style = Style::new().fg(Color::White).bg(Color::DarkGray);
 pub const HELP_KEY: Style = Style::new().fg(Color::Yellow);
 pub const BORDER: Style = Style::new().fg(Color::DarkGray);

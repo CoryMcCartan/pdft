@@ -6,20 +6,6 @@ use hayro::hayro_syntax::Pdf;
 use hayro::vello_cpu::color::palette::css::WHITE;
 use image::{DynamicImage, RgbaImage};
 
-/// Render a page at the given scale, optionally capping the output size.
-/// `page_idx` is 0-based.
-/// `max_width`/`max_height` cap the pixel dimensions.
-pub fn render_page(
-    pdf: &Pdf,
-    page_idx: usize,
-    scale: f32,
-    max_width: Option<u16>,
-    max_height: Option<u16>,
-) -> Result<DynamicImage> {
-    let cache = RenderCache::new();
-    render_page_with_cache(pdf, page_idx, scale, max_width, max_height, &cache)
-}
-
 /// Render using a caller-provided cache for reuse across multiple pages
 /// of the same document.
 pub fn render_page_with_cache<'a>(

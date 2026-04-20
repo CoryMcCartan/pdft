@@ -30,6 +30,7 @@ pub fn delete_pages(
     }
 
     doc.delete_pages(&to_delete);
+    doc.prune_objects();
     doc.save(output)
         .with_context(|| format!("failed to save {}", output.display()))?;
 

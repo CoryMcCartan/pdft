@@ -32,6 +32,7 @@ pub fn split_pages(
 
     if !pages_to_delete.is_empty() {
         result.delete_pages(&pages_to_delete);
+        result.prune_objects();
     }
 
     result

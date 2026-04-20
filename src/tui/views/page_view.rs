@@ -150,6 +150,9 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, state: &mut PageViewState) {
 }
 
 /// Split a line into spans, highlighting case-insensitive matches of `query`.
+///
+/// Works correctly with multi-byte UTF-8 by mapping between byte offsets
+/// of the original and lowercased strings via their char boundaries.
 fn highlight_line<'a>(line: &'a str, query: &str) -> Line<'a> {
     if query.is_empty() {
         return Line::raw(line);
@@ -157,39 +160,148 @@ fn highlight_line<'a>(line: &'a str, query: &str) -> Line<'a> {
 
     let lower = line.to_lowercase();
     let q_lower = query.to_lowercase();
-    let q_len = q_lower.len();
+
+    // Build a mapping from byte offsets in `lower` to byte offsets in `line`.
+    // Both strings have the same number of chars, but may differ in byte lengths
+    // (e.g. 'İ' (2 bytes) lowercases to 'i̇' (3 bytes)).
+    let orig_offsets: Vec<usize> = line.char_indices().map(|(i, _)| i).collect();
+    let lower_offsets: Vec<usize> = lower.char_indices().map(|(i, _)| i).collect();
+
+    // Also need end-of-string offset
+    let orig_end = line.len();
+    let lower_end = lower.len();
+
+    // Map a byte offset in `lower` to the corresponding byte offset in `line`.
+    let lower_to_orig = |lower_byte: usize| -> usize {
+        if lower_byte == lower_end {
+            return orig_end;
+        }
+        // Find which char index this byte offset corresponds to
+        match lower_offsets.binary_search(&lower_byte) {
+            Ok(char_idx) => orig_offsets[char_idx],
+            Err(_) => orig_end, // shouldn't happen at char boundaries
+        }
+    };
 
     let mut spans: Vec<Span<'a>> = Vec::new();
-    let mut last_end = 0;
+    let mut last_end_lower = 0usize;
 
     let mut search_from = 0;
     while let Some(pos) = lower[search_from..].find(&q_lower) {
-        let abs_pos = search_from + pos;
+        let match_start_lower = search_from + pos;
+        let match_end_lower = match_start_lower + q_lower.len();
+
+        let match_start_orig = lower_to_orig(match_start_lower);
+        let match_end_orig = lower_to_orig(match_end_lower);
+        let last_end_orig = lower_to_orig(last_end_lower);
 
         // Add non-matching text before this match
-        if abs_pos > last_end {
-            spans.push(Span::raw(&line[last_end..abs_pos]));
+        if match_start_orig > last_end_orig {
+            spans.push(Span::raw(&line[last_end_orig..match_start_orig]));
         }
 
         // Add highlighted match
         spans.push(Span::styled(
-            &line[abs_pos..abs_pos + q_len],
+            &line[match_start_orig..match_end_orig],
             theme::SEARCH_HIGHLIGHT,
         ));
 
-        last_end = abs_pos + q_len;
-        search_from = last_end;
+        last_end_lower = match_end_lower;
+        search_from = match_end_lower;
     }
 
     // Remaining text after last match
-    if last_end < line.len() {
-        spans.push(Span::raw(&line[last_end..]));
+    let last_end_orig = lower_to_orig(last_end_lower);
+    if last_end_orig < line.len() {
+        spans.push(Span::raw(&line[last_end_orig..]));
     }
 
     if spans.is_empty() {
         Line::raw(line)
     } else {
         Line::from(spans)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spans_text(line: &Line) -> Vec<String> {
+        line.spans.iter().map(|s| s.content.to_string()).collect()
+    }
+
+    #[test]
+    fn highlight_no_query() {
+        let line = highlight_line("hello world", "");
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(line.spans[0].content, "hello world");
+    }
+
+    #[test]
+    fn highlight_no_match() {
+        let line = highlight_line("hello world", "xyz");
+        assert_eq!(line.spans.len(), 1);
+    }
+
+    #[test]
+    fn highlight_single_match() {
+        let line = highlight_line("hello world", "world");
+        let texts = spans_text(&line);
+        assert_eq!(texts, vec!["hello ", "world"]);
+    }
+
+    #[test]
+    fn highlight_multiple_matches() {
+        let line = highlight_line("abcabc", "abc");
+        let texts = spans_text(&line);
+        assert_eq!(texts, vec!["abc", "abc"]);
+    }
+
+    #[test]
+    fn highlight_case_insensitive() {
+        let line = highlight_line("Hello HELLO", "hello");
+        let texts = spans_text(&line);
+        assert_eq!(texts, vec!["Hello", " ", "HELLO"]);
+    }
+
+    #[test]
+    fn highlight_ascii_safe() {
+        // Basic ASCII search should always work
+        let line = highlight_line("foo bar baz", "bar");
+        let texts = spans_text(&line);
+        assert_eq!(texts, vec!["foo ", "bar", " baz"]);
+    }
+
+    #[test]
+    fn highlight_multibyte_utf8() {
+        // This tests the UTF-8 safety of highlight_line.
+        // With multi-byte chars, byte offsets from lowercase can differ.
+        let line = highlight_line("café résumé", "é");
+        // Should not panic and should find matches
+        assert!(line.spans.len() > 1);
+    }
+
+    #[test]
+    fn highlight_at_start() {
+        let line = highlight_line("abc def", "abc");
+        let texts = spans_text(&line);
+        assert_eq!(texts, vec!["abc", " def"]);
+    }
+
+    #[test]
+    fn centered_rect_wider_area() {
+        let r = centered_image_rect(200, 400, Rect::new(0, 0, 80, 40));
+        // Image is portrait, area is wide - should be centered horizontally
+        assert!(r.x > 0);
+        assert!(r.width < 80);
+    }
+
+    #[test]
+    fn centered_rect_zero_image() {
+        let area = Rect::new(5, 5, 40, 20);
+        let r = centered_image_rect(0, 0, area);
+        assert_eq!(r, area);
     }
 }
 

@@ -1,6 +1,5 @@
 mod app;
 mod cli;
-mod ext;
 mod model;
 mod ops;
 mod render;

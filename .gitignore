@@ -4,4 +4,6 @@
 *.bak
 .claude/
 
+*.pdf
+
 target/

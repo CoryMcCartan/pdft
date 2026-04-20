@@ -1,4 +1,4 @@
-use crate::app::{App, LayoutMode, ViewMode};
+use crate::app::{App, LayoutMode, TextScroll, ViewMode};
 use crate::render::cache::ImageCache;
 use crate::render::renderer;
 use crate::render::text_layout;
@@ -32,6 +32,15 @@ impl PdfStore {
         Self { pdfs: Vec::new() }
     }
 
+    /// Load from raw bytes (avoids re-reading the file).
+    fn load_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        let pdf = Pdf::new(bytes.to_vec())
+            .map_err(|e| anyhow::anyhow!("failed to parse PDF: {e:?}"))?;
+        self.pdfs.push(pdf);
+        Ok(())
+    }
+
+    /// Fallback: load from path (for merged docs without cached bytes).
     fn load(&mut self, path: &Path) -> Result<()> {
         let bytes = std::fs::read(path)?;
         let pdf = Pdf::new(bytes)
@@ -65,7 +74,11 @@ pub fn run(path: &Path) -> Result<()> {
     app.open_file(path)?;
 
     let mut pdf_store = PdfStore::new();
-    pdf_store.load(path)?;
+    // Use the raw bytes already loaded by PdfDocument to avoid re-reading the file
+    match app.workspace.documents[0].raw_bytes() {
+        Some(bytes) => pdf_store.load_bytes(bytes)?,
+        None => pdf_store.load(path)?,
+    }
 
     let mut page_state = PageViewState::new();
     let mut thumb_state = ThumbnailBarState::new();
@@ -261,15 +274,36 @@ fn run_loop(
             // This prevents key-repeat from queueing up many page turns
             // that continue after the key is released.
             let mut key_event = None;
-            if let Event::Key(key) = event::read()? {
-                key_event = Some(key);
-                // Drain queued events, keeping only the last key event
-                while event::poll(Duration::from_millis(0))? {
-                    if let Event::Key(next_key) = event::read()? {
-                        key_event = Some(next_key);
+            let mut resized = false;
+            match event::read()? {
+                Event::Key(key) => {
+                    key_event = Some(key);
+                    // Drain queued events, keeping only the last key event
+                    while event::poll(Duration::from_millis(0))? {
+                        match event::read()? {
+                            Event::Key(next_key) => key_event = Some(next_key),
+                            Event::Resize(_, _) => resized = true,
+                            _ => {}
+                        }
                     }
                 }
+                Event::Resize(_, _) => resized = true,
+                _ => {}
             }
+
+            // On resize, invalidate rendered state so it redraws at the new size
+            if resized {
+                page_state.rendered_page = None;
+                page_state.text_lines = None;
+                thumb_state.clear();
+                image_cache.clear();
+                let _ = terminal.clear();
+                render_current_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
+                if app.view_mode == ViewMode::Text {
+                    extract_current_text(pdf_store, app, page_state, term_size);
+                }
+            }
+
             if let Some(key) = key_event {
                 let prev_page = app.current_page();
                 let prev_page_count = app.page_count();
@@ -285,8 +319,14 @@ fn run_loop(
                 // New document merged
                 if app.workspace.documents.len() > prev_doc_count {
                     for i in prev_doc_count..app.workspace.documents.len() {
-                        let path = app.workspace.documents[i].path.clone();
-                        if let Err(e) = pdf_store.load(&path) {
+                        let load_result = match app.workspace.documents[i].raw_bytes() {
+                            Some(bytes) => pdf_store.load_bytes(bytes),
+                            None => {
+                                let path = app.workspace.documents[i].path.clone();
+                                pdf_store.load(&path)
+                            }
+                        };
+                        if let Err(e) = load_result {
                             app.status_message = Some(format!("Render load error: {e}"));
                         }
                     }
@@ -300,6 +340,12 @@ fn run_loop(
                     .as_ref()
                     .is_some_and(|s| s.matches.is_empty() && !s.query.is_empty());
                 if needs_search {
+                    // Show searching status before the blocking operation
+                    app.status_message = Some("Searching...".into());
+                    terminal.draw(|f| {
+                        status_bar::render(f, Rect::new(0, 0, f.area().width, 1), app);
+                    })?;
+
                     let page_count = app.page_count();
                     let mut search = app.search.take().unwrap();
                     execute_search(pdf_store, page_count, &app.workspace, &mut search);
@@ -315,6 +361,7 @@ fn run_loop(
                         search.current_match = idx;
                         let (page_idx, _) = search.matches[idx];
                         app.workspace.selected_page = page_idx;
+                        app.scroll_to_match = true;
                         let total = search.matches.len();
                         app.status_message =
                             Some(format!("Match {}/{total} for '{}'", idx + 1, search.query));
@@ -378,21 +425,37 @@ fn run_loop(
                     if app.current_page() != prev_page || needs_search {
                         update_match_positions(pdf_store, app);
                     }
+
+                    // Scroll text view to match position after search navigation
+                    if app.scroll_to_match && app.view_mode == ViewMode::Text {
+                        if let Some(ref search) = app.search {
+                            if let Some(&first_frac) = search.current_page_match_positions.first() {
+                                if let Some((_, ref lines)) = page_state.text_lines {
+                                    let total_lines = lines.len() as u16;
+                                    let visible_rows = term_size.height.saturating_sub(12);
+                                    let target_line = (first_frac * total_lines as f32) as u16;
+                                    // Center the match in the viewport
+                                    page_state.text_scroll = target_line.saturating_sub(visible_rows / 2);
+                                    let max = total_lines.saturating_sub(visible_rows);
+                                    page_state.text_scroll = page_state.text_scroll.min(max);
+                                }
+                            }
+                        }
+                    }
+                    app.scroll_to_match = false;
                 }
 
-                // Apply text scroll delta
-                let delta = app.text_scroll_delta;
-                if delta != 0 {
-                    app.text_scroll_delta = 0;
+                // Apply text scroll command
+                let scroll = app.text_scroll;
+                if scroll != TextScroll::None {
+                    app.text_scroll = TextScroll::None;
                     let visible_rows = term_size.height.saturating_sub(12);
-                    if delta == i16::MAX {
-                        page_state.scroll_down(u16::MAX / 2, visible_rows);
-                    } else if delta == i16::MIN {
-                        page_state.text_scroll = 0;
-                    } else if delta > 0 {
-                        page_state.scroll_down(delta as u16, visible_rows);
-                    } else {
-                        page_state.scroll_up((-delta) as u16);
+                    match scroll {
+                        TextScroll::Bottom => page_state.scroll_down(u16::MAX / 2, visible_rows),
+                        TextScroll::Top => page_state.text_scroll = 0,
+                        TextScroll::Lines(n) if n > 0 => page_state.scroll_down(n as u16, visible_rows),
+                        TextScroll::Lines(n) => page_state.scroll_up((-n) as u16),
+                        TextScroll::None => {}
                     }
                 }
             }

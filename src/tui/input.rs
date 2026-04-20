@@ -1,4 +1,4 @@
-use crate::app::{App, Mode, SearchState, ViewMode};
+use crate::app::{App, Mode, SearchState, TextScroll, ViewMode};
 use crate::tui::views::dialog::InputDialog;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -35,6 +35,16 @@ pub fn handle_key(app: &mut App, key: KeyEvent, dialog: &mut InputDialog) -> boo
 
     if app.show_help {
         app.show_help = false;
+        return true;
+    }
+
+    // Pending g: next key determines action (g = first page)
+    if app.pending_g {
+        app.pending_g = false;
+        if let KeyCode::Char('g') = key.code {
+            app.workspace.selected_page = 0;
+        }
+        // Any other key after g is ignored (consumed)
         return true;
     }
 
@@ -100,12 +110,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent, dialog: &mut InputDialog) -> boo
         }
         KeyCode::Char('h') | KeyCode::Left => {
             if app.view_mode == ViewMode::Text {
-                app.text_scroll_delta = -3;
+                app.text_scroll = TextScroll::Lines(-3);
             }
         }
         KeyCode::Char('l') | KeyCode::Right => {
             if app.view_mode == ViewMode::Text {
-                app.text_scroll_delta = 3;
+                app.text_scroll = TextScroll::Lines(3);
             }
         }
         KeyCode::Char('d') | KeyCode::Char('x') => {
@@ -114,9 +124,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, dialog: &mut InputDialog) -> boo
             let indices: Vec<usize> = (start..=end).collect();
             // Clear assignments — delete and assign are mutually exclusive
             app.workspace.assign_output(&indices, None);
-            for i in start..=end {
-                app.workspace.toggle_delete(i);
-            }
+            app.workspace.toggle_delete_batch(&indices);
             app.visual_anchor = None;
         }
         KeyCode::Char('a') => {
@@ -136,14 +144,22 @@ pub fn handle_key(app: &mut App, key: KeyEvent, dialog: &mut InputDialog) -> boo
             if app.workspace.documents.is_empty() {
                 app.status_message = Some("No documents loaded".into());
             } else {
-                app.mode = Mode::SaveInput;
-                dialog.title = "Save".into();
-                dialog.prompt = "Save to:".into();
-                let path = app
-                    .original_path()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                dialog.open_with(&path);
+                let has_groups = app.workspace.pages.iter().any(|p| p.output_target.is_some());
+                if has_groups {
+                    // Go straight to per-group prompts using original path as base
+                    let base = app.original_path().unwrap_or_default();
+                    app.prepare_group_saves(&base);
+                    prompt_next_group_save(app, dialog);
+                } else {
+                    app.mode = Mode::SaveInput;
+                    dialog.title = "Save".into();
+                    dialog.prompt = "Save to:".into();
+                    let path = app
+                        .original_path()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    dialog.open_with(&path);
+                }
             }
         }
         KeyCode::Char('m') => {
@@ -189,7 +205,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, dialog: &mut InputDialog) -> boo
             app.workspace.selected_page = last;
         }
         KeyCode::Char('g') => {
-            app.workspace.selected_page = 0;
+            app.pending_g = true;
         }
         KeyCode::Home => {
             app.workspace.selected_page = 0;
@@ -200,12 +216,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent, dialog: &mut InputDialog) -> boo
         }
         KeyCode::PageDown => {
             if app.view_mode == ViewMode::Text {
-                app.text_scroll_delta = 20;
+                app.text_scroll = TextScroll::Lines(20);
             }
         }
         KeyCode::PageUp => {
             if app.view_mode == ViewMode::Text {
-                app.text_scroll_delta = -20;
+                app.text_scroll = TextScroll::Lines(-20);
             }
         }
         _ => return false,
@@ -237,18 +253,7 @@ fn handle_dialog_submit(
         }
         Mode::SaveInput => {
             let path = std::path::PathBuf::from(input.trim());
-            let has_groups = app
-                .workspace
-                .pages
-                .iter()
-                .any(|p| p.output_target.is_some());
-
-            if has_groups {
-                // Grouped save: prepare the list, then prompt for each file
-                app.prepare_group_saves(&path);
-                prompt_next_group_save(app, dialog);
-                return;
-            } else if path.exists() {
+            if path.exists() {
                 app.pending_save_path = Some(path);
                 app.mode = Mode::SaveConfirm;
                 dialog.prompt = "File exists. Overwrite? (y/n)".into();
@@ -355,6 +360,8 @@ fn prompt_next_group_save(app: &mut App, dialog: &mut crate::tui::views::dialog:
 }
 
 fn search_next(app: &mut App, reverse: bool) {
+    let cur_page = app.workspace.selected_page;
+
     let search = match &mut app.search {
         Some(s) if !s.matches.is_empty() => s,
         _ => {
@@ -363,18 +370,29 @@ fn search_next(app: &mut App, reverse: bool) {
         }
     };
 
+    let len = search.matches.len();
+
     if reverse {
-        if search.current_match == 0 {
-            search.current_match = search.matches.len() - 1;
-        } else {
-            search.current_match -= 1;
-        }
+        // Find the last match on a page before (or equal to) current page,
+        // or wrap to the last match in the document.
+        search.current_match = search
+            .matches
+            .iter()
+            .rposition(|&(p, _)| p < cur_page)
+            .unwrap_or(len - 1);
     } else {
-        search.current_match = (search.current_match + 1) % search.matches.len();
+        // Find the first match on a page after current page,
+        // or wrap to the first match in the document.
+        search.current_match = search
+            .matches
+            .iter()
+            .position(|&(p, _)| p > cur_page)
+            .unwrap_or(0);
     }
 
     let (page_idx, _count) = search.matches[search.current_match];
     app.workspace.selected_page = page_idx;
+    app.scroll_to_match = true;
     let pos = search.current_match + 1;
     let total = search.matches.len();
     app.status_message = Some(format!("Match {pos}/{total}"));

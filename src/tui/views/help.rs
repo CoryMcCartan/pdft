@@ -9,7 +9,7 @@ const BINDINGS: &[(&str, &str)] = &[
     ("k/↑", "Previous page"),
     ("h/←", "Scroll up (text view)"),
     ("l/→", "Scroll down (text view)"),
-    ("g/G", "First/last page"),
+    ("gg/G", "First/last page"),
     (":", "Go to page number"),
     ("v", "Visual select mode"),
     ("d/x", "Toggle delete (clears group)"),

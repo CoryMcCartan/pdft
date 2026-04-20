@@ -137,3 +137,73 @@ pub fn collect_page_indices(ranges: &[PageRange]) -> Vec<usize> {
     indices.dedup();
     indices
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_single_page() {
+        let ranges = parse_page_ranges("3").unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].start, 3);
+        assert_eq!(ranges[0].end, 3);
+    }
+
+    #[test]
+    fn parse_range() {
+        let ranges = parse_page_ranges("2-5").unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].start, 2);
+        assert_eq!(ranges[0].end, 5);
+    }
+
+    #[test]
+    fn parse_comma_separated() {
+        let ranges = parse_page_ranges("1,3-5,7").unwrap();
+        assert_eq!(ranges.len(), 3);
+    }
+
+    #[test]
+    fn parse_with_whitespace() {
+        let ranges = parse_page_ranges(" 1 , 3 - 5 ").unwrap();
+        assert_eq!(ranges.len(), 2);
+    }
+
+    #[test]
+    fn parse_rejects_zero() {
+        assert!(parse_page_ranges("0").is_err());
+        assert!(parse_page_ranges("0-3").is_err());
+        assert!(parse_page_ranges("1-0").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_reversed_range() {
+        assert!(parse_page_ranges("5-3").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_empty() {
+        assert!(parse_page_ranges("").is_err());
+        assert!(parse_page_ranges(",,,").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_non_numeric() {
+        assert!(parse_page_ranges("abc").is_err());
+    }
+
+    #[test]
+    fn to_indices_converts_to_zero_based() {
+        let r = PageRange { start: 1, end: 3 };
+        let indices: Vec<usize> = r.to_indices().collect();
+        assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn collect_deduplicates_and_sorts() {
+        let ranges = parse_page_ranges("3,1-3,5").unwrap();
+        let indices = collect_page_indices(&ranges);
+        assert_eq!(indices, vec![0, 1, 2, 4]);
+    }
+}
