@@ -59,6 +59,9 @@ pub struct TextStampUndo {
     pub resources_obj_id: Option<lopdf::ObjectId>,
 }
 
+/// Maximum number of undo entries kept per document to bound memory use.
+const MAX_UNDO_DEPTH: usize = 50;
+
 pub struct PdfDocument {
     pub path: PathBuf,
     pub label: String,
@@ -473,20 +476,29 @@ impl PdfDocument {
             font_name,
             resources_obj_id,
         });
+        if self.text_stamp_undos.len() > MAX_UNDO_DEPTH {
+            self.text_stamp_undos.remove(0);
+        }
 
         Ok(())
     }
 
-    /// Re-serialize the lopdf document to update raw_bytes (for hayro re-rendering).
-    pub fn refresh_bytes(&mut self) -> Result<()> {
+    /// Re-serialize the lopdf document and return the bytes (for hayro re-rendering).
+    /// The caller is responsible for updating the hayro PdfStore; raw_bytes is NOT
+    /// updated here — call drop_raw_bytes() after the PdfStore is reloaded.
+    pub fn refresh_bytes(&mut self) -> Result<Vec<u8>> {
         // Clone before saving — save_to mutates internal state (max_id, trailer)
         // which would corrupt the document for subsequent edits.
         let mut doc_clone = self.doc.clone();
         let mut buf = Vec::new();
         doc_clone.save_to(&mut buf)
             .with_context(|| "failed to serialize PDF after modification")?;
-        self.raw_bytes = Some(buf);
-        Ok(())
+        Ok(buf)
+    }
+
+    /// Drop cached raw bytes to reclaim memory once the hayro PdfStore is up to date.
+    pub fn drop_raw_bytes(&mut self) {
+        self.raw_bytes = None;
     }
 
     /// Embed a PNG image as a signature on the given page.
@@ -695,6 +707,9 @@ impl PdfDocument {
             resources_obj_id,
             page_id,
         });
+        if self.signature_undos.len() > MAX_UNDO_DEPTH {
+            self.signature_undos.remove(0);
+        }
 
         Ok(())
     }

@@ -87,16 +87,8 @@ fn reload_pdf(
     thumb_state: &mut ThumbnailBarState,
     image_cache: &mut ImageCache,
 ) {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) => {
-            app.status_message = Some(format!("Watch: {e}"));
-            return;
-        }
-    };
-
-    // Re-open the document
-    let doc = match crate::model::document::PdfDocument::open(path) {
+    // Re-open the document (PdfDocument::open reads the file and caches raw bytes).
+    let mut doc = match crate::model::document::PdfDocument::open(path) {
         Ok(d) => d,
         Err(e) => {
             app.status_message = Some(format!("Watch: {e}"));
@@ -105,6 +97,19 @@ fn reload_pdf(
     };
 
     let page_count = doc.page_count();
+
+    // Reload hayro PDF using the bytes already held by the new doc, then drop them.
+    pdf_store.pdfs.clear();
+    let load_result = match doc.raw_bytes() {
+        Some(bytes) => pdf_store.load_bytes(bytes),
+        None => pdf_store.load(path),
+    };
+    doc.drop_raw_bytes();
+    if let Err(e) = load_result {
+        app.status_message = Some(format!("Watch render: {e}"));
+        return;
+    }
+
     app.workspace.documents[0] = doc;
 
     // Rebuild page list
@@ -120,13 +125,6 @@ fn reload_pdf(
     // Clamp selected page
     if app.workspace.selected_page >= page_count {
         app.workspace.selected_page = page_count.saturating_sub(1);
-    }
-
-    // Reload hayro PDF for rendering
-    pdf_store.pdfs.clear();
-    if let Err(e) = pdf_store.load_bytes(&bytes) {
-        app.status_message = Some(format!("Watch render: {e}"));
-        return;
     }
 
     // Invalidate all caches
@@ -170,11 +168,13 @@ pub fn run(path: &Path, force_halfblock: bool, start_text: bool, start_page: Opt
     app.extract_comments();
 
     let mut pdf_store = PdfStore::new();
-    // Use the raw bytes already loaded by PdfDocument to avoid re-reading the file
+    // Use the raw bytes already loaded by PdfDocument to avoid re-reading the file,
+    // then drop them — the hayro PdfStore now owns the only copy.
     match app.workspace.documents[0].raw_bytes() {
         Some(bytes) => pdf_store.load_bytes(bytes)?,
         None => pdf_store.load(path)?,
     }
+    app.workspace.documents[0].drop_raw_bytes();
 
     let mut page_state = PageViewState::new();
     let mut thumb_state = ThumbnailBarState::new();
@@ -701,28 +701,25 @@ fn run_loop(
                     Err(e) => {
                         app.status_message = Some(format!("Refresh error: {e}"));
                     }
-                    Ok(()) => {
-                        let bytes = doc.raw_bytes().map(|b| b.to_vec());
-                        if let Some(bytes) = bytes {
-                            match hayro::hayro_syntax::Pdf::new(bytes) {
-                                Ok(pdf) => {
-                                    if doc_id < pdf_store.pdfs.len() {
-                                        pdf_store.pdfs[doc_id] = pdf;
-                                    }
-                                    // Invalidate current page cache and re-render
-                                    page_state.rendered_page = None;
-                                    page_state.rendered_page_right = None;
-                                    page_state.text_lines = None;
-                                    image_cache.clear();
-                                    render_current_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
-                                    render_spread_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
-                                    if app.view_mode == ViewMode::Text {
-                                        extract_current_text(pdf_store, app, page_state, term_size);
-                                    }
+                    Ok(bytes) => {
+                        match hayro::hayro_syntax::Pdf::new(bytes) {
+                            Ok(pdf) => {
+                                if doc_id < pdf_store.pdfs.len() {
+                                    pdf_store.pdfs[doc_id] = pdf;
                                 }
-                                Err(e) => {
-                                    app.status_message = Some(format!("Render refresh failed: {e:?}"));
+                                // Invalidate current page cache and re-render
+                                page_state.rendered_page = None;
+                                page_state.rendered_page_right = None;
+                                page_state.text_lines = None;
+                                image_cache.clear();
+                                render_current_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
+                                render_spread_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
+                                if app.view_mode == ViewMode::Text {
+                                    extract_current_text(pdf_store, app, page_state, term_size);
                                 }
+                            }
+                            Err(e) => {
+                                app.status_message = Some(format!("Render refresh failed: {e:?}"));
                             }
                         }
                     }
@@ -742,28 +739,30 @@ fn run_loop(
                     match doc.embed_signature(page_num, &sig_path, pdf_x, pdf_y, sig_width) {
                         Ok(()) => {
                             // Refresh bytes for hayro and reload
-                            if let Err(e) = doc.refresh_bytes() {
-                                app.status_message = Some(format!("Refresh error: {e}"));
-                            } else if let Some(bytes) = doc.raw_bytes() {
-                                // Reload hayro PDF for re-rendering
-                                match hayro::hayro_syntax::Pdf::new(bytes.to_vec()) {
-                                    Ok(pdf) => {
-                                        if doc_id < pdf_store.pdfs.len() {
-                                            pdf_store.pdfs[doc_id] = pdf;
+                            match doc.refresh_bytes() {
+                                Err(e) => {
+                                    app.status_message = Some(format!("Refresh error: {e}"));
+                                }
+                                Ok(bytes) => {
+                                    match hayro::hayro_syntax::Pdf::new(bytes) {
+                                        Ok(pdf) => {
+                                            if doc_id < pdf_store.pdfs.len() {
+                                                pdf_store.pdfs[doc_id] = pdf;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            app.status_message = Some(format!("PDF reload error: {e:?}"));
                                         }
                                     }
-                                    Err(e) => {
-                                        app.status_message = Some(format!("PDF reload error: {e:?}"));
-                                    }
+                                    // Invalidate caches
+                                    page_state.rendered_page = None;
+                                    page_state.rendered_page_right = None;
+                                    image_cache.clear();
+                                    thumb_state.clear();
+                                    render_current_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
+                                    render_spread_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
+                                    app.status_message = Some("Signature placed. Save to keep changes.".into());
                                 }
-                                // Invalidate caches
-                                page_state.rendered_page = None;
-                                page_state.rendered_page_right = None;
-                                image_cache.clear();
-                                thumb_state.clear();
-                                render_current_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
-                                render_spread_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
-                                app.status_message = Some("Signature placed. Save to keep changes.".into());
                             }
                         }
                         Err(e) => {
@@ -788,26 +787,29 @@ fn run_loop(
                         doc.undo_signature()
                     };
                     if undone {
-                        if let Err(e) = doc.refresh_bytes() {
-                            app.status_message = Some(format!("Undo refresh error: {e}"));
-                        } else if let Some(bytes) = doc.raw_bytes() {
-                            match hayro::hayro_syntax::Pdf::new(bytes.to_vec()) {
-                                Ok(pdf) => {
-                                    if doc_id < pdf_store.pdfs.len() {
-                                        pdf_store.pdfs[doc_id] = pdf;
+                        match doc.refresh_bytes() {
+                            Err(e) => {
+                                app.status_message = Some(format!("Undo refresh error: {e}"));
+                            }
+                            Ok(bytes) => {
+                                match hayro::hayro_syntax::Pdf::new(bytes) {
+                                    Ok(pdf) => {
+                                        if doc_id < pdf_store.pdfs.len() {
+                                            pdf_store.pdfs[doc_id] = pdf;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        app.status_message = Some(format!("Undo reload error: {e:?}"));
                                     }
                                 }
-                                Err(e) => {
-                                    app.status_message = Some(format!("Undo reload error: {e:?}"));
-                                }
+                                page_state.rendered_page = None;
+                                page_state.rendered_page_right = None;
+                                image_cache.clear();
+                                thumb_state.clear();
+                                render_current_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
+                                render_spread_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
+                                app.status_message = Some("Undone".into());
                             }
-                            page_state.rendered_page = None;
-                            page_state.rendered_page_right = None;
-                            image_cache.clear();
-                            thumb_state.clear();
-                            render_current_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
-                            render_spread_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
-                            app.status_message = Some("Undone".into());
                         }
                     }
                 }
@@ -1084,6 +1086,12 @@ fn render_nearby_thumbnails(
 
     // Compute visible range based on layout mode
     let (start, end) = visible_thumb_range(app, current, page_count, term_size);
+
+    // Evict thumbnails far outside the visible window to bound memory use.
+    // Keep a small buffer beyond the visible range for smooth scrolling.
+    let evict_start = start.saturating_sub(10);
+    let evict_end = (end + 10).min(page_count);
+    thumb_state.evict_outside(evict_start, evict_end);
 
     // Thumbnail area is ~8 rows tall
     let (_, max_th) = area_to_pixels(Rect::new(0, 0, 20, 8), font_size);

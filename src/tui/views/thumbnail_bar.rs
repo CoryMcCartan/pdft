@@ -44,6 +44,19 @@ impl ThumbnailBarState {
         self.protocols.clear();
     }
 
+    /// Drop cached images and protocols for pages outside [keep_start, keep_end).
+    /// Keeps the Vec allocation but frees the image data itself.
+    pub fn evict_outside(&mut self, keep_start: usize, keep_end: usize) {
+        for i in 0..self.images.len() {
+            if i < keep_start || i >= keep_end {
+                self.images[i] = None;
+                if i < self.protocols.len() {
+                    self.protocols[i] = None;
+                }
+            }
+        }
+    }
+
     /// Returns true if a thumbnail has been rendered for this page (image stored
     /// or protocol already created from it).
     pub fn is_rendered(&self, page_idx: usize) -> bool {

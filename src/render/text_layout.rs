@@ -161,7 +161,8 @@ fn snap_y_to_grid(chars: &mut [PlacedChar]) {
     }
 
     // Collect unique y-positions (rounded to 0.1pt to merge near-duplicates)
-    let mut ys: Vec<f64> = chars.iter().map(|c| (c.y * 10.0).round() / 10.0).collect();
+    let mut ys: Vec<f64> = Vec::with_capacity(chars.len());
+    ys.extend(chars.iter().map(|c| (c.y * 10.0).round() / 10.0));
     ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     ys.dedup();
 
@@ -170,7 +171,8 @@ fn snap_y_to_grid(chars: &mut [PlacedChar]) {
     }
 
     // Compute all gaps between consecutive unique y-positions
-    let mut gaps: Vec<f64> = ys.windows(2).map(|w| w[1] - w[0]).collect();
+    let mut gaps: Vec<f64> = Vec::with_capacity(ys.len() - 1);
+    gaps.extend(ys.windows(2).map(|w| w[1] - w[0]));
     gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     // Find the dominant line spacing.

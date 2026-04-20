@@ -3,6 +3,18 @@ use crate::tui::views::dialog::InputDialog;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind, MouseButton};
 use ratatui::layout::Rect;
 
+/// Advance the current page forward or backward, stepping 2 in spread mode.
+fn navigate_pages(app: &mut App, forward: bool) {
+    if app.spread_mode != SpreadMode::Off {
+        if forward { app.next_page(); app.next_page(); }
+        else { app.prev_page(); app.prev_page(); }
+    } else if forward {
+        app.next_page();
+    } else {
+        app.prev_page();
+    }
+}
+
 /// Parse a single coordinate value. Supports:
 /// - "50%" → percentage of page dimension
 /// - "1.5in" → inches (converted to points at 72pt/in)
@@ -79,22 +91,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent, dialog: &mut InputDialog) -> boo
             KeyCode::Char('q') => {
                 app.should_quit = true;
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if app.spread_mode != SpreadMode::Off {
-                    app.next_page();
-                    app.next_page();
-                } else {
-                    app.next_page();
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if app.spread_mode != SpreadMode::Off {
-                    app.prev_page();
-                    app.prev_page();
-                } else {
-                    app.prev_page();
-                }
-            }
+            KeyCode::Char('j') | KeyCode::Down => navigate_pages(app, true),
+            KeyCode::Char('k') | KeyCode::Up => navigate_pages(app, false),
             KeyCode::Char('g') if app.pending_g => {
                 app.workspace.selected_page = 0;
                 app.pending_g = false;
@@ -269,22 +267,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent, dialog: &mut InputDialog) -> boo
                 app.should_quit = true;
             }
         }
-        KeyCode::Char('j') | KeyCode::Down => {
-            if app.spread_mode != SpreadMode::Off {
-                app.next_page();
-                app.next_page();
-            } else {
-                app.next_page();
-            }
-        }
-        KeyCode::Char('k') | KeyCode::Up => {
-            if app.spread_mode != SpreadMode::Off {
-                app.prev_page();
-                app.prev_page();
-            } else {
-                app.prev_page();
-            }
-        }
+        KeyCode::Char('j') | KeyCode::Down => navigate_pages(app, true),
+        KeyCode::Char('k') | KeyCode::Up => navigate_pages(app, false),
         KeyCode::Char('h') | KeyCode::Left => {
             if app.view_mode == ViewMode::Text {
                 app.text_scroll = TextScroll::Lines(-3);
