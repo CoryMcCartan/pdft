@@ -44,16 +44,25 @@ impl ThumbnailBarState {
         self.protocols.clear();
     }
 
+    /// Returns true if a thumbnail has been rendered for this page (image stored
+    /// or protocol already created from it).
+    pub fn is_rendered(&self, page_idx: usize) -> bool {
+        self.images.get(page_idx).is_some_and(|i| i.is_some())
+            || self.protocols.get(page_idx).is_some_and(|p| p.is_some())
+    }
+
     /// Get or create a protocol for the given page index.
+    /// Consumes the stored DynamicImage (moving it into the protocol) to avoid
+    /// keeping two full-resolution copies in memory simultaneously.
     /// Returns None if no image is cached for this page.
     fn get_protocol(&mut self, page_idx: usize, picker: &Picker) -> Option<&mut StatefulProtocol> {
         if page_idx >= self.images.len() {
             return None;
         }
-        // Create protocol from image if needed
+        // Create protocol from image if needed, consuming the stored image.
         if self.protocols[page_idx].is_none() {
-            if let Some(img) = &self.images[page_idx] {
-                self.protocols[page_idx] = Some(picker.new_resize_protocol(img.clone()));
+            if let Some(img) = self.images[page_idx].take() {
+                self.protocols[page_idx] = Some(picker.new_resize_protocol(img));
             }
         }
         self.protocols[page_idx].as_mut()

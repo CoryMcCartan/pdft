@@ -179,7 +179,7 @@ pub fn run(path: &Path, force_halfblock: bool, start_text: bool, start_page: Opt
     let mut page_state = PageViewState::new();
     let mut thumb_state = ThumbnailBarState::new();
     let mut input_dialog = InputDialog::new("", "");
-    let mut image_cache = ImageCache::new(32);
+    let mut image_cache = ImageCache::new(16);
 
     let font_size = picker.font_size();
     let sz = terminal.size()?;
@@ -428,8 +428,16 @@ fn run_loop(
             false
         };
 
-        // Use shorter poll when thumbnails are still loading so we redraw quickly
-        let poll_ms = if rendered_any { 10 } else { 100 };
+        // Pre-render the next page into the image cache so navigation is instant.
+        // Only runs if there's nothing more urgent (thumbnails still loading).
+        let prefetched = if !rendered_any && app.layout_mode != LayoutMode::ThumbnailsOnly {
+            prefetch_next_page(pdf_store, app, image_cache, term_size, font_size)
+        } else {
+            false
+        };
+
+        // Use shorter poll when background work is still running so we redraw quickly
+        let poll_ms = if rendered_any || prefetched { 10 } else { 100 };
 
         if event::poll(Duration::from_millis(poll_ms))? {
             // Read the event and drain any queued duplicates (debounce).
@@ -807,6 +815,55 @@ fn run_loop(
     Ok(())
 }
 
+/// Pre-render the next page into the image cache so navigation to it is instant.
+/// Uses the same resolution parameters as render_current_page.
+fn prefetch_next_page(
+    store: &PdfStore,
+    app: &App,
+    image_cache: &mut ImageCache,
+    term_size: Rect,
+    font_size: (u16, u16),
+) -> bool {
+    let current = app.current_page();
+    let page_count = app.page_count();
+    let next_idx = current + 1;
+    if next_idx >= page_count {
+        return false;
+    }
+
+    let slot = match app.workspace.pages.get(next_idx) {
+        Some(s) => s,
+        None => return false,
+    };
+    let doc_id = slot.source.doc_id;
+    let page_num = slot.source.page_num;
+
+    let base_cols = term_size.width.saturating_sub(14);
+    let view_cols = if app.spread_mode != crate::app::SpreadMode::Off { base_cols / 2 } else { base_cols };
+    let view_rows = match app.layout_mode {
+        LayoutMode::NoThumbnails => term_size.height.saturating_sub(3),
+        _ => term_size.height.saturating_sub(11),
+    };
+    let (max_w, max_h) = area_to_pixels(Rect::new(0, 0, view_cols, view_rows), font_size);
+
+    if image_cache.get(doc_id, page_num, max_w, max_h).is_some() {
+        return false; // already cached
+    }
+
+    let pdf = match store.get(doc_id) {
+        Some(p) => p,
+        None => return false,
+    };
+
+    let cache = RenderCache::new();
+    if let Ok(image) = renderer::render_page_with_cache(pdf, page_num, 2.0, Some(max_w), Some(max_h), &cache) {
+        image_cache.put(doc_id, page_num, max_w, max_h, image);
+        true
+    } else {
+        false
+    }
+}
+
 /// Compute pixel dimensions from a terminal cell area and font size.
 fn area_to_pixels(area: Rect, font_size: (u16, u16)) -> (u16, u16) {
     let (fw, fh) = font_size;
@@ -1015,7 +1072,7 @@ fn render_nearby_thumbnails(
             if rendered >= batch_size {
                 break;
             }
-            if thumb_state.images.get(page_idx).is_some_and(|t| t.is_some()) {
+            if thumb_state.is_rendered(page_idx) {
                 continue;
             }
 
