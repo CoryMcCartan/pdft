@@ -1,11 +1,11 @@
 # pdft
 
-Terminal PDF viewer and editor. View PDF pages as images or extracted text,
-fill form fields, add text and signatures, mark pages for deletion, assign
-pages to output groups for splitting, merge documents, and search text.
+Vibe-coded terminal PDF viewer and editor. View PDF pages as images or
+extracted text, fill form fields, add text and signatures, mark pages for
+deletion, assign pages to output groups for splitting, merge documents, and
+search text.
 
-Works best in a terminal with image support (kitty, ghostty, iTerm2, sixel).
-Falls back to text mode in terminals without graphics protocol support.
+Works best in a terminal with image support (kitty, ghostty, iTerm2, sixel; falls back to text mode in terminals without graphics protocol support).
 
 ## Installation
 
