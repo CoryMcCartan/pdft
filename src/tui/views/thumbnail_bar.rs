@@ -60,6 +60,13 @@ impl ThumbnailBarState {
     }
 }
 
+/// Get the group label for a page, if assigned.
+fn group_label<'a>(app: &'a App, page_idx: usize) -> Option<&'a str> {
+    let slot = app.workspace.pages.get(page_idx)?;
+    let id = slot.output_target?;
+    Some(app.workspace.output_targets.get(id)?.label.as_str())
+}
+
 /// Compute thumbnail cell width from a fixed cell height.
 fn thumb_cell_width(cell_height: u16) -> u16 {
     ((cell_height as f32) * 1.4).ceil() as u16
@@ -72,6 +79,7 @@ fn render_thumb(
     page_idx: usize,
     is_current: bool,
     is_deleted: bool,
+    group_label: Option<&str>,
     proto: Option<&mut StatefulProtocol>,
 ) {
     let border_style = if is_current {
@@ -82,16 +90,27 @@ fn render_thumb(
         theme::BORDER
     };
 
+    let mut title = format!(" {} ", page_idx + 1);
+    if is_deleted {
+        title.push('×');
+    }
+    if let Some(lbl) = group_label {
+        title.push_str(lbl);
+    }
+    if is_deleted || group_label.is_some() {
+        title.push(' ');
+    }
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
-        .title(format!(" {} ", page_idx + 1));
+        .title(title);
 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     if let Some(proto) = proto {
-        let image = StatefulImage::new().resize(Resize::Scale(None));
+        let image = StatefulImage::new().resize(Resize::Scale(Some(ratatui_image::FilterType::Triangle)));
         f.render_stateful_widget(image, inner, proto);
     }
 }
@@ -131,9 +150,10 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, state: &mut ThumbnailBarStat
 
         let is_current = page_idx == current;
         let is_deleted = app.workspace.pages.get(page_idx).is_some_and(|p| p.marked_for_delete);
+        let label = group_label(app, page_idx);
         let proto = state.get_protocol(page_idx, picker);
 
-        render_thumb(f, thumb_area, page_idx, is_current, is_deleted, proto);
+        render_thumb(f, thumb_area, page_idx, is_current, is_deleted, label, proto);
 
         x += w + 1;
     }
@@ -178,8 +198,9 @@ pub fn render_grid(f: &mut Frame, area: Rect, app: &App, state: &mut ThumbnailBa
         let thumb_area = Rect::new(x, y, cell_w, cell_h);
         let is_current = page_idx == current;
         let is_deleted = app.workspace.pages.get(page_idx).is_some_and(|p| p.marked_for_delete);
+        let label = group_label(app, page_idx);
         let proto = state.get_protocol(page_idx, picker);
 
-        render_thumb(f, thumb_area, page_idx, is_current, is_deleted, proto);
+        render_thumb(f, thumb_area, page_idx, is_current, is_deleted, label, proto);
     }
 }

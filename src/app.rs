@@ -1,4 +1,5 @@
-use crate::model::page_ref::{OutputTarget, OutputTargetId};
+use crate::model::document::{FormField, FormFieldUndo};
+use crate::model::page_ref::{Comment, OutputTarget, OutputTargetId};
 use crate::model::workspace::Workspace;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -37,6 +38,25 @@ pub enum Mode {
     SaveGroupInput,
     SearchInput,
     GotoPage,
+    SignaturePathInput,
+    SignaturePlacing,
+    SignaturePositionInput,
+    TextPlacing,
+    TextPositionInput,
+    TextContentInput,
+    FormFilling,
+    FormFieldInput,
+}
+
+/// Spread view mode for two-page display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpreadMode {
+    /// Single page view.
+    Off,
+    /// Book spread: page 1 alone on right, then 2-3, 4-5, etc.
+    Book,
+    /// Paired spread: pages 1-2, 3-4, 5-6, etc.
+    Paired,
 }
 
 /// Text scroll command from input to event loop.
@@ -89,6 +109,36 @@ pub struct App {
     pub pending_g: bool,
     /// Signal to scroll text view to the current search match.
     pub scroll_to_match: bool,
+    /// Sidebar list scroll offset (set by render, read by mouse handler).
+    pub sidebar_offset: usize,
+    /// Per-page comments extracted from PDF annotations.
+    pub comments: Vec<Vec<Comment>>,
+    /// Path to signature PNG file.
+    pub signature_path: Option<PathBuf>,
+    /// Pending signature placement: (pdf_x, pdf_y) in points from bottom-left.
+    pub pending_signature: Option<(f64, f64)>,
+    /// Flag to undo a signature in the event loop (needs re-render).
+    pub pending_signature_undo: bool,
+    /// Signature display width in PDF points.
+    pub signature_width_pt: f64,
+    /// Pending text stamp placement: (pdf_x, pdf_y) in points from bottom-left.
+    pub pending_text_stamp: Option<(f64, f64)>,
+    /// Font size for text stamps in PDF points.
+    pub text_stamp_size_pt: f64,
+    /// Flag: a content-stream mutation needs hayro re-render (signature, text stamp).
+    pub needs_pdf_refresh: bool,
+    /// Flag: a form field value changed (save-relevant but no visual change in hayro).
+    pub form_dirty: bool,
+    /// Form fields extracted from the current document.
+    pub form_fields: Vec<FormField>,
+    /// Currently selected form field index.
+    pub form_field_index: usize,
+    /// Undo stack for form field value changes.
+    pub form_field_undos: Vec<FormFieldUndo>,
+    /// Spread view mode: Off, OddLeft (1 alone, then 2-3, 4-5...), EvenLeft (1-2, 3-4...).
+    pub spread_mode: SpreadMode,
+    /// Whether file watching is active.
+    pub watching: bool,
 }
 
 impl App {
@@ -96,7 +146,7 @@ impl App {
         Self {
             workspace: Workspace::new(),
             view_mode: ViewMode::Image,
-            layout_mode: LayoutMode::Normal,
+            layout_mode: LayoutMode::NoThumbnails,
             focus: Focus::Sidebar,
             mode: Mode::Normal,
             should_quit: false,
@@ -110,6 +160,21 @@ impl App {
             pending_assign: false,
             pending_g: false,
             scroll_to_match: false,
+            sidebar_offset: 0,
+            comments: Vec::new(),
+            signature_path: None,
+            pending_signature: None,
+            signature_width_pt: 150.0,
+            pending_signature_undo: false,
+            pending_text_stamp: None,
+            text_stamp_size_pt: 11.0,
+            needs_pdf_refresh: false,
+            form_dirty: false,
+            form_fields: Vec::new(),
+            form_field_index: 0,
+            form_field_undos: Vec::new(),
+            spread_mode: SpreadMode::Off,
+            watching: false,
         }
     }
 
@@ -301,9 +366,90 @@ impl App {
         Ok(())
     }
 
+    /// Get the spread pair for the current page.
+    /// Returns (left_page, right_page) where either can be None (blank half).
+    pub fn spread_pages(&self) -> (Option<usize>, Option<usize>) {
+        let cur = self.workspace.selected_page;
+        let count = self.page_count();
+        match self.spread_mode {
+            SpreadMode::Off => (Some(cur), None),
+            SpreadMode::Book => {
+                // Page 0 alone on right, then (1,2), (3,4), ...
+                if cur == 0 {
+                    (None, Some(0))
+                } else {
+                    // Find the pair: odd pages on left, even on right
+                    let left = if cur % 2 == 1 { cur } else { cur - 1 };
+                    let right = left + 1;
+                    (
+                        Some(left),
+                        if right < count { Some(right) } else { None },
+                    )
+                }
+            }
+            SpreadMode::Paired => {
+                // (0,1), (2,3), (4,5), ...
+                let left = cur & !1; // round down to even
+                let right = left + 1;
+                (
+                    Some(left),
+                    if right < count { Some(right) } else { None },
+                )
+            }
+        }
+    }
+
     /// Get the original file path of the first document.
     pub fn original_path(&self) -> Option<PathBuf> {
         self.workspace.documents.first().map(|d| d.path.clone())
+    }
+
+    /// Extract comments from all pages and populate `self.comments`.
+    pub fn extract_comments(&mut self) {
+        self.comments.clear();
+        for slot in &self.workspace.pages {
+            let doc = &self.workspace.documents[slot.source.doc_id];
+            self.comments.push(doc.extract_comments(slot.source.page_num));
+        }
+    }
+
+    /// Jump to the next page that has comments. Wraps around.
+    pub fn next_comment_page(&mut self) {
+        let cur = self.workspace.selected_page;
+        let count = self.page_count();
+        // Search forward from current+1, wrapping
+        for offset in 1..=count {
+            let idx = (cur + offset) % count;
+            if self.comments.get(idx).is_some_and(|c| !c.is_empty()) {
+                self.workspace.selected_page = idx;
+                self.status_message = Some(format!(
+                    "Comment on page {} ({} comment(s))",
+                    idx + 1,
+                    self.comments[idx].len()
+                ));
+                return;
+            }
+        }
+        self.status_message = Some("No comments found".into());
+    }
+
+    /// Jump to the previous page that has comments. Wraps around.
+    pub fn prev_comment_page(&mut self) {
+        let cur = self.workspace.selected_page;
+        let count = self.page_count();
+        for offset in 1..=count {
+            let idx = (cur + count - offset) % count;
+            if self.comments.get(idx).is_some_and(|c| !c.is_empty()) {
+                self.workspace.selected_page = idx;
+                self.status_message = Some(format!(
+                    "Comment on page {} ({} comment(s))",
+                    idx + 1,
+                    self.comments[idx].len()
+                ));
+                return;
+            }
+        }
+        self.status_message = Some("No comments found".into());
     }
 }
 
@@ -397,13 +543,13 @@ mod tests {
     #[test]
     fn cycle_layout() {
         let mut app = App::new();
-        assert_eq!(app.layout_mode, LayoutMode::Normal);
-        app.cycle_layout();
         assert_eq!(app.layout_mode, LayoutMode::NoThumbnails);
         app.cycle_layout();
         assert_eq!(app.layout_mode, LayoutMode::ThumbnailsOnly);
         app.cycle_layout();
         assert_eq!(app.layout_mode, LayoutMode::Normal);
+        app.cycle_layout();
+        assert_eq!(app.layout_mode, LayoutMode::NoThumbnails);
     }
 
     #[test]

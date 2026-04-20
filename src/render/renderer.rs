@@ -22,12 +22,14 @@ pub fn render_page_with_cache<'a>(
         .get(page_idx)
         .with_context(|| format!("page {page_idx} out of range"))?;
 
-    // If max dimensions are set, compute a scale that fits within them
+    // Compute scale to fill the available area (maintaining aspect ratio).
+    // Use at least `scale` as a minimum quality floor.
     let (page_w, page_h) = page.render_dimensions();
     let effective_scale = if let (Some(mw), Some(mh)) = (max_width, max_height) {
         let sw = mw as f32 / page_w;
         let sh = mh as f32 / page_h;
-        scale.min(sw).min(sh)
+        // Fit within max dims (use smaller ratio), but don't go below base scale
+        sw.min(sh).max(scale)
     } else {
         scale
     };

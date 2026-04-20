@@ -19,8 +19,13 @@ const BINDINGS: &[(&str, &str)] = &[
     ("m", "Merge another PDF"),
     ("/", "Search text"),
     ("n/N", "Next/previous match"),
+    ("[/]", "Prev/next comment"),
     ("t", "Toggle image/text view"),
     ("w", "Cycle layout"),
+    ("2", "Toggle two-page spread"),
+    ("A", "Add text to page"),
+    ("S", "Place signature (PNG)"),
+    ("F", "Fill form fields"),
     ("?", "Toggle help"),
     ("q/Esc", "Quit / exit visual mode"),
 ];

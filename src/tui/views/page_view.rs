@@ -1,4 +1,4 @@
-use crate::app::{App, ViewMode};
+use crate::app::{App, Mode, ViewMode};
 use crate::tui::theme;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -18,6 +18,14 @@ pub struct PageViewState {
     pub text_lines: Option<(usize, Vec<String>)>,
     /// Vertical scroll offset for text view.
     pub text_scroll: u16,
+    /// The terminal Rect where the page image was last rendered (for click mapping).
+    pub image_area: Option<Rect>,
+    /// Right page protocol for two-page spread view.
+    pub protocol_right: Option<StatefulProtocol>,
+    /// Right page image dimensions for spread view.
+    pub image_size_right: Option<(u32, u32)>,
+    /// Right page index currently rendered in spread view.
+    pub rendered_page_right: Option<usize>,
 }
 
 impl PageViewState {
@@ -28,6 +36,10 @@ impl PageViewState {
             image_size: None,
             text_lines: None,
             text_scroll: 0,
+            image_area: None,
+            protocol_right: None,
+            image_size_right: None,
+            rendered_page_right: None,
         }
     }
 
@@ -47,15 +59,17 @@ impl PageViewState {
 
 /// Compute a centered sub-rect for an image with the given pixel dimensions,
 /// fitted proportionally into the available terminal area.
-fn centered_image_rect(img_w: u32, img_h: u32, area: Rect) -> Rect {
+/// `font_size` is (width, height) in pixels per cell.
+fn centered_image_rect(img_w: u32, img_h: u32, area: Rect, font_size: (u16, u16)) -> Rect {
     if img_w == 0 || img_h == 0 || area.width == 0 || area.height == 0 {
         return area;
     }
 
-    // Approximate: terminal cells are roughly 2:1 (height:width in pixels).
-    // Compute how many columns/rows the image will occupy.
+    let (fw, fh) = (font_size.0.max(1) as f64, font_size.1.max(1) as f64);
+    // Cell aspect ratio: cell_width_px / cell_height_px
+    let cell_aspect = fw / fh;
+
     let aspect = img_w as f64 / img_h as f64;
-    let cell_aspect = 0.5; // each cell is ~twice as tall as wide in pixels
     let area_w = area.width as f64;
     let area_h = area.height as f64;
 
@@ -83,7 +97,7 @@ fn centered_image_rect(img_w: u32, img_h: u32, area: Rect) -> Rect {
     )
 }
 
-pub fn render(f: &mut Frame, area: Rect, app: &App, state: &mut PageViewState) {
+pub fn render(f: &mut Frame, area: Rect, app: &App, state: &mut PageViewState, font_size: (u16, u16)) {
     match app.view_mode {
         ViewMode::Image => {
             let bg_style = Style::default().bg(Color::Black);
@@ -92,20 +106,118 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, state: &mut PageViewState) {
             let bg_block = Block::default().borders(Borders::NONE).style(bg_style);
             f.render_widget(bg_block, area);
 
-            if let Some(ref mut proto) = state.protocol {
+            // Two-page spread view
+            if app.spread_mode != crate::app::SpreadMode::Off {
+                let (left_page, right_page) = app.spread_pages();
+
+                // Compute the width each page needs, then center the pair
+                let left_size = state.image_size;
+                let right_size = state.image_size_right;
+
+                // Calculate how wide each page is in cells (using aspect ratio)
+                let (fw, fh) = (font_size.0.max(1) as f64, font_size.1.max(1) as f64);
+                let cell_aspect = fw / fh;
+
+                let page_cell_width = |size: Option<(u32, u32)>| -> u16 {
+                    if let Some((iw, ih)) = size {
+                        let aspect = iw as f64 / ih as f64;
+                        let w_from_h = area.height as f64 * aspect / cell_aspect;
+                        (w_from_h.round() as u16).min(area.width / 2)
+                    } else {
+                        area.width / 2
+                    }
+                };
+
+                let left_w = if left_page.is_some() { page_cell_width(left_size) } else { 0 };
+                let right_w = if right_page.is_some() { page_cell_width(right_size) } else { 0 };
+                let total_w = left_w + right_w;
+
+                // Center the pair horizontally
+                let x_offset = area.width.saturating_sub(total_w) / 2;
+                let left_area = Rect::new(area.x + x_offset, area.y, left_w, area.height);
+                let right_area = Rect::new(area.x + x_offset + left_w, area.y, right_w, area.height);
+
+                // Render left page
+                if left_page.is_some() {
+                    if let Some(ref mut proto) = state.protocol {
+                        let img_area = if let Some((iw, ih)) = state.image_size {
+                            centered_image_rect(iw, ih, left_area, font_size)
+                        } else {
+                            left_area
+                        };
+                        state.image_area = Some(img_area);
+
+                        let image = StatefulImage::new().resize(Resize::Scale(Some(ratatui_image::FilterType::Triangle)));
+                        f.render_stateful_widget(image, img_area, proto);
+
+                        if let Some(ref search) = app.search {
+                            render_match_ticks(f, &search.current_page_match_positions, left_area, img_area);
+                        }
+                        if let Some(left_idx) = left_page {
+                            if let Some(comments) = app.comments.get(left_idx) {
+                                if !comments.is_empty() {
+                                    let positions: Vec<f32> = comments.iter().map(|c| c.y_fraction).collect();
+                                    render_comment_ticks(f, &positions, left_area, img_area);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Render right page
+                if right_page.is_some() {
+                    if let Some(ref mut proto) = state.protocol_right {
+                        let img_area = if let Some((iw, ih)) = state.image_size_right {
+                            centered_image_rect(iw, ih, right_area, font_size)
+                        } else {
+                            right_area
+                        };
+
+                        let image = StatefulImage::new().resize(Resize::Scale(Some(ratatui_image::FilterType::Triangle)));
+                        f.render_stateful_widget(image, img_area, proto);
+                    }
+                }
+
+                if state.protocol.is_none() && state.protocol_right.is_none() {
+                    let msg = if app.page_count() == 0 { "No pages loaded" } else { "Rendering..." };
+                    let p = Paragraph::new(msg).style(bg_style);
+                    f.render_widget(p, area);
+                }
+            } else if let Some(ref mut proto) = state.protocol {
+                // Single page view (original code)
                 // Center the image within the area
                 let img_area = if let Some((iw, ih)) = state.image_size {
-                    centered_image_rect(iw, ih, area)
+                    centered_image_rect(iw, ih, area, font_size)
                 } else {
                     area
                 };
+                state.image_area = Some(img_area);
 
-                let image = StatefulImage::new().resize(Resize::Scale(None));
+                let image = StatefulImage::new().resize(Resize::Scale(Some(ratatui_image::FilterType::Triangle)));
                 f.render_stateful_widget(image, img_area, proto);
 
                 // Render search match indicators in the left margin
                 if let Some(ref search) = app.search {
                     render_match_ticks(f, &search.current_page_match_positions, area, img_area);
+                }
+
+                // Render comment indicators in the left margin (yellow)
+                if let Some(comments) = app.comments.get(app.current_page()) {
+                    if !comments.is_empty() {
+                        let positions: Vec<f32> = comments.iter().map(|c| c.y_fraction).collect();
+                        render_comment_ticks(f, &positions, area, img_area);
+                    }
+                }
+
+                // Render form field indicators in the right margin (green)
+                if app.mode == Mode::FormFilling {
+                    let current_page = app.current_page();
+                    let positions: Vec<(f32, bool)> = app.form_fields.iter()
+                        .enumerate()
+                        .filter(|(_, field)| field.page_num == current_page)
+                        .map(|(i, field)| (field.y_fraction, i == app.form_field_index))
+                        .collect();
+                    render_form_field_ticks(f, &positions, area, img_area);
                 }
             } else {
                 let msg = if app.page_count() == 0 {
@@ -129,7 +241,11 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, state: &mut PageViewState) {
                 .map(|s| s.query.as_str())
                 .unwrap_or("");
 
-            let lines: Vec<Line> = if let Some((cached_page, ref text)) = state.text_lines {
+            let comment_fracs: Vec<f32> = app.comments.get(app.current_page())
+                .map(|c| c.iter().map(|c| c.y_fraction).collect())
+                .unwrap_or_default();
+
+            let mut lines: Vec<Line> = if let Some((cached_page, ref text)) = state.text_lines {
                 if cached_page == app.current_page() {
                     text.iter()
                         .map(|l| highlight_line(l, query))
@@ -140,6 +256,18 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, state: &mut PageViewState) {
             } else {
                 vec![Line::raw("  Extracting text...")]
             };
+
+            // Highlight lines near comment positions
+            if !comment_fracs.is_empty() && lines.len() > 1 {
+                let total = lines.len() as f32;
+                for i in 0..lines.len() {
+                    let line_frac = i as f32 / total;
+                    if comment_fracs.iter().any(|&cf| (cf - line_frac).abs() < 1.5 / total) {
+                        let line = std::mem::take(&mut lines[i]);
+                        lines[i] = line.patch_style(theme::COMMENT_HIGHLIGHT);
+                    }
+                }
+            }
 
             let p = Paragraph::new(lines)
                 .block(block)
@@ -291,7 +419,7 @@ mod tests {
 
     #[test]
     fn centered_rect_wider_area() {
-        let r = centered_image_rect(200, 400, Rect::new(0, 0, 80, 40));
+        let r = centered_image_rect(200, 400, Rect::new(0, 0, 80, 40), (8, 16));
         // Image is portrait, area is wide - should be centered horizontally
         assert!(r.x > 0);
         assert!(r.width < 80);
@@ -300,7 +428,7 @@ mod tests {
     #[test]
     fn centered_rect_zero_image() {
         let area = Rect::new(5, 5, 40, 20);
-        let r = centered_image_rect(0, 0, area);
+        let r = centered_image_rect(0, 0, area, (8, 16));
         assert_eq!(r, area);
     }
 }
@@ -330,6 +458,65 @@ fn render_match_ticks(
         if row >= full_area.y && row < full_area.y + full_area.height {
             let tick_area = Rect::new(margin_x, row, 1, 1);
             f.render_widget(Paragraph::new("▌").style(tick_style), tick_area);
+        }
+    }
+}
+
+/// Render green tick marks in the right margin at form field positions.
+fn render_form_field_ticks(
+    f: &mut Frame,
+    positions: &[(f32, bool)], // (y_fraction, is_active)
+    full_area: Rect,
+    img_area: Rect,
+) {
+    if positions.is_empty() || img_area.height == 0 {
+        return;
+    }
+
+    // Use the right margin (after comment ticks, offset by 1 more)
+    let margin_x = (img_area.x + img_area.width + 1).min(full_area.x + full_area.width - 1);
+
+    for &(frac, is_active) in positions {
+        let tick_style = if is_active {
+            theme::FORM_FIELD_ACTIVE
+        } else {
+            theme::FORM_FIELD
+        };
+        let bg_style = if is_active {
+            Style::default().fg(Color::LightGreen).bg(Color::LightGreen)
+        } else {
+            Style::default().fg(Color::Green).bg(Color::Green)
+        };
+        let row = img_area.y + (frac * img_area.height as f32).round() as u16;
+        if row >= full_area.y && row < full_area.y + full_area.height {
+            let tick_area = Rect::new(margin_x, row, 1, 1);
+            let _ = tick_style; // used for text-mode styling if needed
+            f.render_widget(Paragraph::new("▐").style(bg_style), tick_area);
+        }
+    }
+}
+
+/// Render yellow tick marks in the right margin at comment positions.
+fn render_comment_ticks(
+    f: &mut Frame,
+    positions: &[f32],
+    full_area: Rect,
+    img_area: Rect,
+) {
+    if positions.is_empty() || img_area.height == 0 {
+        return;
+    }
+
+    let tick_style = Style::default().fg(Color::Yellow).bg(Color::Yellow);
+
+    // Use the right margin (after the image)
+    let margin_x = (img_area.x + img_area.width).min(full_area.x + full_area.width - 1);
+
+    for &frac in positions {
+        let row = img_area.y + (frac * img_area.height as f32).round() as u16;
+        if row >= full_area.y && row < full_area.y + full_area.height {
+            let tick_area = Rect::new(margin_x, row, 1, 1);
+            f.render_widget(Paragraph::new("▐").style(tick_style), tick_area);
         }
     }
 }

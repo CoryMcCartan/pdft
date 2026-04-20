@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 
 const VISUAL_STYLE: Style = Style::new().fg(Color::White).bg(Color::DarkGray);
 
-pub fn render(f: &mut Frame, area: Rect, app: &App) {
+pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
     // Build a set of page indices that have search matches
     let match_pages: std::collections::HashSet<usize> = app
         .search
@@ -22,10 +22,14 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .enumerate()
         .map(|(i, slot)| {
-            let selected = i == app.current_page();
+            let selected = {
+                let (left, right) = app.spread_pages();
+                left == Some(i) || right == Some(i)
+            };
             let in_visual = app.visual_anchor.is_some() && app.is_selected(i);
             let deleted = slot.marked_for_delete;
             let has_match = match_pages.contains(&i);
+            let has_comment = app.comments.get(i).is_some_and(|c| !c.is_empty());
 
             let marker = if selected { ">" } else { " " };
             let del_marker = if deleted { "×" } else { " " };
@@ -41,7 +45,8 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 None => String::new(),
             };
 
-            let text = format!("{marker}{del_marker}{:>3}{group_label}", i + 1);
+            let comment_marker = if has_comment { "●" } else { "" };
+            let text = format!("{marker}{del_marker}{:>3}{group_label}{comment_marker}", i + 1);
 
             let style = if selected {
                 theme::SELECTED
@@ -51,6 +56,8 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 theme::DELETED
             } else if has_match {
                 theme::SEARCH_MATCH_PAGE
+            } else if has_comment {
+                theme::COMMENT_PAGE
             } else {
                 theme::NORMAL
             };
@@ -74,4 +81,5 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 
     let mut state = ListState::default().with_selected(Some(app.current_page()));
     f.render_stateful_widget(list, area, &mut state);
+    app.sidebar_offset = state.offset();
 }

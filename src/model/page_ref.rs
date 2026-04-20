@@ -24,6 +24,15 @@ pub struct PageSlot {
 /// Index into Workspace::output_targets.
 pub type OutputTargetId = usize;
 
+/// A comment/annotation extracted from a PDF page.
+#[derive(Debug, Clone)]
+pub struct Comment {
+    /// The text content of the annotation.
+    pub text: String,
+    /// Vertical position as a fraction [0.0, 1.0] of the page height (top=0).
+    pub y_fraction: f32,
+}
+
 /// A named output file for split operations.
 #[derive(Debug, Clone)]
 pub struct OutputTarget {

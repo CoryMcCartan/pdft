@@ -7,8 +7,8 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// PDF file to open in interactive mode
-    #[arg(value_name = "FILE")]
+    /// PDF file
+    #[arg(value_name = "FILE", global = true)]
     pub file: Option<PathBuf>,
 }
 
@@ -18,6 +18,22 @@ pub enum Command {
     View {
         /// PDF file to view
         file: PathBuf,
+
+        /// Force halfblock rendering (no kitty/sixel graphics)
+        #[arg(long)]
+        halfblock: bool,
+
+        /// Start in text mode
+        #[arg(long)]
+        text: bool,
+
+        /// Open at page number (1-indexed)
+        #[arg(short, long)]
+        page: Option<usize>,
+
+        /// Watch the file for changes and reload automatically
+        #[arg(long)]
+        watch: bool,
     },
 
     /// Merge multiple PDFs into one
@@ -74,12 +90,12 @@ pub enum Command {
         #[arg(short, long, default_value = "1")]
         page: usize,
 
-        /// Terminal columns (default: 80)
-        #[arg(short = 'W', long, default_value = "80")]
+        /// Terminal columns (auto-detected if omitted)
+        #[arg(short = 'W', long, default_value = "0", hide_default_value = true)]
         width: u16,
 
-        /// Terminal rows (default: 60)
-        #[arg(short = 'H', long, default_value = "60")]
+        /// Terminal rows (auto-detected if omitted)
+        #[arg(short = 'H', long, default_value = "0", hide_default_value = true)]
         height: u16,
     },
 }

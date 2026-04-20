@@ -16,9 +16,10 @@ use page_view::PageViewState;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui_image::picker::Picker;
+use ratatui_image::picker::{Picker, ProtocolType};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::Duration;
 use thumbnail_bar::ThumbnailBarState;
 
@@ -57,10 +58,97 @@ impl PdfStore {
 /// Max thumbnails to render per event loop tick to stay responsive.
 const THUMB_BATCH_SIZE: usize = 3;
 
+/// Start a background file watcher that sends the path on the channel when it changes.
+fn start_file_watcher(path: PathBuf, tx: mpsc::Sender<PathBuf>) -> Result<()> {
+    use notify_debouncer_mini::{new_debouncer, notify};
+    use std::time::Duration as Dur;
+
+    let watch_path = path.clone();
+    let mut debouncer = new_debouncer(Dur::from_millis(500), move |res: Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>| {
+        if res.is_ok() {
+            let _ = tx.send(path.clone());
+        }
+    }).map_err(|e| anyhow::anyhow!("failed to create file watcher: {e}"))?;
+
+    debouncer.watcher().watch(&watch_path, notify::RecursiveMode::NonRecursive)
+        .map_err(|e| anyhow::anyhow!("failed to watch file: {e}"))?;
+
+    // Leak the debouncer so it lives for the duration of the process
+    std::mem::forget(debouncer);
+    Ok(())
+}
+
+/// Reload the PDF from disk, replacing the document and re-rendering.
+fn reload_pdf(
+    path: &Path,
+    app: &mut App,
+    pdf_store: &mut PdfStore,
+    page_state: &mut PageViewState,
+    thumb_state: &mut ThumbnailBarState,
+    image_cache: &mut ImageCache,
+) {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            app.status_message = Some(format!("Watch: {e}"));
+            return;
+        }
+    };
+
+    // Re-open the document
+    let doc = match crate::model::document::PdfDocument::open(path) {
+        Ok(d) => d,
+        Err(e) => {
+            app.status_message = Some(format!("Watch: {e}"));
+            return;
+        }
+    };
+
+    let page_count = doc.page_count();
+    app.workspace.documents[0] = doc;
+
+    // Rebuild page list
+    app.workspace.pages.clear();
+    for page_num in 0..page_count {
+        app.workspace.pages.push(crate::model::page_ref::PageSlot {
+            source: crate::model::page_ref::PageRef { doc_id: 0, page_num },
+            output_target: None,
+            marked_for_delete: false,
+        });
+    }
+
+    // Clamp selected page
+    if app.workspace.selected_page >= page_count {
+        app.workspace.selected_page = page_count.saturating_sub(1);
+    }
+
+    // Reload hayro PDF for rendering
+    pdf_store.pdfs.clear();
+    if let Err(e) = pdf_store.load_bytes(&bytes) {
+        app.status_message = Some(format!("Watch render: {e}"));
+        return;
+    }
+
+    // Invalidate all caches
+    image_cache.clear();
+    page_state.rendered_page = None;
+    page_state.rendered_page_right = None;
+    page_state.text_lines = None;
+    thumb_state.clear();
+
+    // Re-extract comments
+    app.extract_comments();
+
+    app.status_message = Some("Reloaded".into());
+}
+
 /// Launch the TUI for viewing a PDF file.
-pub fn run(path: &Path) -> Result<()> {
-    let picker = Picker::from_query_stdio()
+pub fn run(path: &Path, force_halfblock: bool, start_text: bool, start_page: Option<usize>, watch: bool) -> Result<()> {
+    let mut picker = Picker::from_query_stdio()
         .unwrap_or_else(|_| Picker::from_fontsize((8, 16)));
+    if force_halfblock {
+        picker.set_protocol_type(ProtocolType::Halfblocks);
+    }
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -71,7 +159,15 @@ pub fn run(path: &Path) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new();
+    if start_text || picker.protocol_type() == ProtocolType::Halfblocks {
+        app.view_mode = crate::app::ViewMode::Text;
+    }
     app.open_file(path)?;
+    if let Some(p) = start_page {
+        let idx = p.saturating_sub(1).min(app.page_count().saturating_sub(1));
+        app.workspace.selected_page = idx;
+    }
+    app.extract_comments();
 
     let mut pdf_store = PdfStore::new();
     // Use the raw bytes already loaded by PdfDocument to avoid re-reading the file
@@ -90,7 +186,22 @@ pub fn run(path: &Path) -> Result<()> {
     let term_rect = Rect::new(0, 0, sz.width, sz.height);
 
     render_current_page(&pdf_store, &app, &picker, &mut page_state, &mut image_cache, term_rect, font_size);
+    render_spread_page(&pdf_store, &app, &picker, &mut page_state, &mut image_cache, term_rect, font_size);
+    if app.view_mode == crate::app::ViewMode::Text {
+        extract_current_text(&pdf_store, &app, &mut page_state, term_rect);
+    }
     render_nearby_thumbnails(&pdf_store, &app, &mut thumb_state, font_size, term_rect, THUMB_BATCH_SIZE);
+
+    // Set up file watcher if --watch was passed
+    let watch_rx = if watch {
+        let (tx, rx) = mpsc::channel();
+        let watch_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        app.watching = true;
+        start_file_watcher(watch_path, tx)?;
+        Some(rx)
+    } else {
+        None
+    };
 
     let result = run_loop(
         &mut terminal,
@@ -101,6 +212,7 @@ pub fn run(path: &Path) -> Result<()> {
         &mut thumb_state,
         &mut input_dialog,
         &mut image_cache,
+        watch_rx.as_ref(),
     );
 
     // Drop all protocol/image state BEFORE restoring the terminal.
@@ -130,10 +242,19 @@ fn run_loop(
     thumb_state: &mut ThumbnailBarState,
     input_dialog: &mut InputDialog,
     image_cache: &mut ImageCache,
+    watch_rx: Option<&mpsc::Receiver<PathBuf>>,
 ) -> Result<()> {
     let font_size = picker.font_size();
 
     loop {
+        // Check for file change notifications
+        if let Some(rx) = watch_rx {
+            if let Ok(path) = rx.try_recv() {
+                // Drain any additional queued notifications
+                while rx.try_recv().is_ok() {}
+                reload_pdf(&path, app, pdf_store, page_state, thumb_state, image_cache);
+            }
+        }
         let sz = terminal.size()?;
         let term_size = Rect::new(0, 0, sz.width, sz.height);
 
@@ -176,7 +297,7 @@ fn run_loop(
                     .split(chunks[chunk_idx]);
 
                 sidebar::render(f, main_chunks[0], app);
-                page_view::render(f, main_chunks[1], app, page_state);
+                page_view::render(f, main_chunks[1], app, page_state, font_size);
                 chunk_idx += 1;
             }
 
@@ -203,6 +324,47 @@ fn run_loop(
             // Bottom bar: dialog, pending assign prompt, or command hints
             if input_dialog.active {
                 dialog::render(f, chunks[chunk_idx], input_dialog);
+            } else if app.mode == crate::app::Mode::TextPlacing {
+                let line = ratatui::text::Line::from(vec![
+                    ratatui::text::Span::styled(" ADD TEXT ", ratatui::style::Style::default()
+                        .fg(ratatui::style::Color::Black)
+                        .bg(ratatui::style::Color::Green)),
+                    ratatui::text::Span::raw(" click to place  "),
+                    ratatui::text::Span::styled(":", crate::tui::theme::HELP_KEY),
+                    ratatui::text::Span::raw(":coords  "),
+                    ratatui::text::Span::styled("Esc", crate::tui::theme::HELP_KEY),
+                    ratatui::text::Span::raw(":cancel"),
+                ]);
+                f.render_widget(ratatui::widgets::Paragraph::new(line), chunks[chunk_idx]);
+            } else if app.mode == crate::app::Mode::FormFilling {
+                let line = ratatui::text::Line::from(vec![
+                    ratatui::text::Span::styled(" FORM ", ratatui::style::Style::default()
+                        .fg(ratatui::style::Color::Black)
+                        .bg(ratatui::style::Color::Green)),
+                    ratatui::text::Span::raw("  "),
+                    ratatui::text::Span::styled("Tab", crate::tui::theme::HELP_KEY),
+                    ratatui::text::Span::raw(":next  "),
+                    ratatui::text::Span::styled("S-Tab", crate::tui::theme::HELP_KEY),
+                    ratatui::text::Span::raw(":prev  "),
+                    ratatui::text::Span::styled("Enter", crate::tui::theme::HELP_KEY),
+                    ratatui::text::Span::raw(":edit  "),
+                    ratatui::text::Span::raw("click:select  "),
+                    ratatui::text::Span::styled("Esc", crate::tui::theme::HELP_KEY),
+                    ratatui::text::Span::raw(":done"),
+                ]);
+                f.render_widget(ratatui::widgets::Paragraph::new(line), chunks[chunk_idx]);
+            } else if app.mode == crate::app::Mode::SignaturePlacing {
+                let line = ratatui::text::Line::from(vec![
+                    ratatui::text::Span::styled(" SIGNATURE ", ratatui::style::Style::default()
+                        .fg(ratatui::style::Color::Black)
+                        .bg(ratatui::style::Color::Yellow)),
+                    ratatui::text::Span::raw(" click to place  "),
+                    ratatui::text::Span::styled(":", crate::tui::theme::HELP_KEY),
+                    ratatui::text::Span::raw(":coords  "),
+                    ratatui::text::Span::styled("Esc", crate::tui::theme::HELP_KEY),
+                    ratatui::text::Span::raw(":cancel"),
+                ]);
+                f.render_widget(ratatui::widgets::Paragraph::new(line), chunks[chunk_idx]);
             } else if app.pending_assign {
                 let line = ratatui::text::Line::from(vec![
                     ratatui::text::Span::styled(" Assign to group: ", crate::tui::theme::HELP_KEY),
@@ -274,6 +436,7 @@ fn run_loop(
             // This prevents key-repeat from queueing up many page turns
             // that continue after the key is released.
             let mut key_event = None;
+            let mut mouse_event = None;
             let mut resized = false;
             match event::read()? {
                 Event::Key(key) => {
@@ -287,6 +450,7 @@ fn run_loop(
                         }
                     }
                 }
+                Event::Mouse(mouse) => mouse_event = Some(mouse),
                 Event::Resize(_, _) => resized = true,
                 _ => {}
             }
@@ -294,13 +458,52 @@ fn run_loop(
             // On resize, invalidate rendered state so it redraws at the new size
             if resized {
                 page_state.rendered_page = None;
+                page_state.rendered_page_right = None;
                 page_state.text_lines = None;
                 thumb_state.clear();
                 image_cache.clear();
                 let _ = terminal.clear();
                 render_current_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
+                render_spread_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
                 if app.view_mode == ViewMode::Text {
                     extract_current_text(pdf_store, app, page_state, term_size);
+                }
+            }
+
+            // Handle mouse events
+            if let Some(mouse) = mouse_event {
+                let prev_page = app.current_page();
+                let img_area = page_state.image_area;
+                let page_dims = app.workspace.pages.get(app.current_page())
+                    .and_then(|slot| {
+                        let doc = &app.workspace.documents[slot.source.doc_id];
+                        doc.page_dimensions().get(slot.source.page_num).copied()
+                    });
+                let consumed = input::handle_mouse(app, mouse, term_size, img_area, page_dims);
+                if consumed && app.current_page() != prev_page {
+                    page_state.text_scroll = 0;
+                    page_state.rendered_page = None;
+                    page_state.rendered_page_right = None;
+                    if app.layout_mode != LayoutMode::ThumbnailsOnly {
+                        render_current_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
+                        render_spread_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
+                    }
+                    if app.view_mode == ViewMode::Text && app.layout_mode != LayoutMode::ThumbnailsOnly {
+                        extract_current_text(pdf_store, app, page_state, term_size);
+                    }
+                    update_match_positions(pdf_store, app);
+                }
+                // Open text input dialog after click-to-place sets TextContentInput mode
+                if app.mode == crate::app::Mode::TextContentInput && !input_dialog.active {
+                    input_dialog.title = "Add text".into();
+                    input_dialog.prompt = "Text:".into();
+                    input_dialog.open();
+                }
+                // Open form field dialog after click selects a field
+                if app.mode == crate::app::Mode::FormFieldInput && !input_dialog.active {
+                    if app.form_field_index < app.form_fields.len() {
+                        input::open_form_field_dialog(app, input_dialog);
+                    }
                 }
             }
 
@@ -311,6 +514,7 @@ fn run_loop(
                 let prev_history_len = app.workspace.history.len();
                 let prev_layout = app.layout_mode;
                 let prev_view_mode = app.view_mode;
+                let prev_spread = app.spread_mode;
                 let had_help = app.show_help;
                 let had_dialog = input_dialog.active;
 
@@ -332,6 +536,7 @@ fn run_loop(
                     }
                     thumb_state.clear();
                     image_cache.clear();
+                    app.extract_comments();
                 }
 
                 // Execute pending search
@@ -389,6 +594,15 @@ fn run_loop(
                 let state_changed = app.workspace.history.len() != prev_history_len;
 
                 let view_mode_changed = app.view_mode != prev_view_mode;
+                let spread_changed = app.spread_mode != prev_spread;
+
+                // Spread toggle requires full clear and cache invalidation (resolution changes)
+                if spread_changed {
+                    page_state.rendered_page = None;
+                    page_state.rendered_page_right = None;
+                    image_cache.clear();
+                    let _ = terminal.clear();
+                }
 
                 let needs_rerender = app.current_page() != prev_page
                     || app.workspace.documents.len() > prev_doc_count
@@ -396,7 +610,8 @@ fn run_loop(
                     || overlay_dismissed
                     || page_count_changed
                     || state_changed
-                    || view_mode_changed;
+                    || view_mode_changed
+                    || spread_changed;
 
                 if needs_rerender {
                     // Reset text scroll when page changes
@@ -407,7 +622,9 @@ fn run_loop(
                     // Only render the main page if it's actually visible
                     if app.layout_mode != LayoutMode::ThumbnailsOnly {
                         page_state.rendered_page = None;
+                        page_state.rendered_page_right = None;
                         render_current_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
+                        render_spread_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
                     }
 
                     // Extract text if in text mode and page changed
@@ -445,18 +662,143 @@ fn run_loop(
                     app.scroll_to_match = false;
                 }
 
-                // Apply text scroll command
-                let scroll = app.text_scroll;
-                if scroll != TextScroll::None {
-                    app.text_scroll = TextScroll::None;
-                    let visible_rows = term_size.height.saturating_sub(12);
-                    match scroll {
-                        TextScroll::Bottom => page_state.scroll_down(u16::MAX / 2, visible_rows),
-                        TextScroll::Top => page_state.text_scroll = 0,
-                        TextScroll::Lines(n) if n > 0 => page_state.scroll_down(n as u16, visible_rows),
-                        TextScroll::Lines(n) => page_state.scroll_up((-n) as u16),
-                        TextScroll::None => {}
+            }
+
+            // Refresh after document mutation (text stamp, form field edit, etc.)
+            if app.needs_pdf_refresh {
+                app.needs_pdf_refresh = false;
+                let doc_id = app.workspace.pages.get(app.current_page())
+                    .map(|s| s.source.doc_id).unwrap_or(0);
+                let doc = &mut app.workspace.documents[doc_id];
+                match doc.refresh_bytes() {
+                    Err(e) => {
+                        app.status_message = Some(format!("Refresh error: {e}"));
                     }
+                    Ok(()) => {
+                        let bytes = doc.raw_bytes().map(|b| b.to_vec());
+                        if let Some(bytes) = bytes {
+                            match hayro::hayro_syntax::Pdf::new(bytes) {
+                                Ok(pdf) => {
+                                    if doc_id < pdf_store.pdfs.len() {
+                                        pdf_store.pdfs[doc_id] = pdf;
+                                    }
+                                    // Invalidate current page cache and re-render
+                                    page_state.rendered_page = None;
+                                    page_state.rendered_page_right = None;
+                                    page_state.text_lines = None;
+                                    image_cache.clear();
+                                    render_current_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
+                                    render_spread_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
+                                    if app.view_mode == ViewMode::Text {
+                                        extract_current_text(pdf_store, app, page_state, term_size);
+                                    }
+                                }
+                                Err(e) => {
+                                    app.status_message = Some(format!("Render refresh failed: {e:?}"));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Execute pending signature placement
+            if let Some((pdf_x, pdf_y)) = app.pending_signature.take() {
+                if let Some(sig_path) = app.signature_path.clone() {
+                    let page_idx = app.current_page();
+                    let slot = &app.workspace.pages[page_idx];
+                    let doc_id = slot.source.doc_id;
+                    let page_num = slot.source.page_num;
+                    let sig_width = app.signature_width_pt;
+
+                    let doc = &mut app.workspace.documents[doc_id];
+                    match doc.embed_signature(page_num, &sig_path, pdf_x, pdf_y, sig_width) {
+                        Ok(()) => {
+                            // Refresh bytes for hayro and reload
+                            if let Err(e) = doc.refresh_bytes() {
+                                app.status_message = Some(format!("Refresh error: {e}"));
+                            } else if let Some(bytes) = doc.raw_bytes() {
+                                // Reload hayro PDF for re-rendering
+                                match hayro::hayro_syntax::Pdf::new(bytes.to_vec()) {
+                                    Ok(pdf) => {
+                                        if doc_id < pdf_store.pdfs.len() {
+                                            pdf_store.pdfs[doc_id] = pdf;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        app.status_message = Some(format!("PDF reload error: {e:?}"));
+                                    }
+                                }
+                                // Invalidate caches
+                                page_state.rendered_page = None;
+                                page_state.rendered_page_right = None;
+                                image_cache.clear();
+                                thumb_state.clear();
+                                let _ = terminal.clear();
+                                render_current_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
+                                render_spread_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
+                                app.status_message = Some("Signature placed. Save to keep changes.".into());
+                            }
+                        }
+                        Err(e) => {
+                            app.status_message = Some(format!("Signature error: {e}"));
+                        }
+                    }
+                }
+            }
+
+            // Undo last document-level mutation (signature or text stamp)
+            if app.pending_signature_undo {
+                app.pending_signature_undo = false;
+                // Find which document has something to undo (prefer text stamps as most recent)
+                let doc_id = app.workspace.documents.iter()
+                    .rposition(|d| !d.text_stamp_undos.is_empty() || !d.signature_undos.is_empty());
+                if let Some(doc_id) = doc_id {
+                    let doc = &mut app.workspace.documents[doc_id];
+                    // Try text stamp undo first, then signature undo
+                    let undone = if !doc.text_stamp_undos.is_empty() {
+                        doc.undo_text_stamp()
+                    } else {
+                        doc.undo_signature()
+                    };
+                    if undone {
+                        if let Err(e) = doc.refresh_bytes() {
+                            app.status_message = Some(format!("Undo refresh error: {e}"));
+                        } else if let Some(bytes) = doc.raw_bytes() {
+                            match hayro::hayro_syntax::Pdf::new(bytes.to_vec()) {
+                                Ok(pdf) => {
+                                    if doc_id < pdf_store.pdfs.len() {
+                                        pdf_store.pdfs[doc_id] = pdf;
+                                    }
+                                }
+                                Err(e) => {
+                                    app.status_message = Some(format!("Undo reload error: {e:?}"));
+                                }
+                            }
+                            page_state.rendered_page = None;
+                            page_state.rendered_page_right = None;
+                            image_cache.clear();
+                            thumb_state.clear();
+                            let _ = terminal.clear();
+                            render_current_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
+                            render_spread_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
+                            app.status_message = Some("Undone".into());
+                        }
+                    }
+                }
+            }
+
+            // Apply text scroll command (from keyboard or mouse)
+            let scroll = app.text_scroll;
+            if scroll != TextScroll::None {
+                app.text_scroll = TextScroll::None;
+                let visible_rows = term_size.height.saturating_sub(12);
+                match scroll {
+                    TextScroll::Bottom => page_state.scroll_down(u16::MAX / 2, visible_rows),
+                    TextScroll::Top => page_state.text_scroll = 0,
+                    TextScroll::Lines(n) if n > 0 => page_state.scroll_down(n as u16, visible_rows),
+                    TextScroll::Lines(n) => page_state.scroll_up((-n) as u16),
+                    TextScroll::None => {}
                 }
             }
         }
@@ -483,7 +825,18 @@ fn render_current_page(
     term_size: Rect,
     font_size: (u16, u16),
 ) {
-    let page_idx = app.current_page();
+    // In spread mode, render the left page from spread_pages()
+    let (left_page, _) = app.spread_pages();
+    let page_idx = match left_page {
+        Some(idx) => idx,
+        None => {
+            // No left page (e.g., Book mode page 0) — clear left protocol
+            page_state.protocol = None;
+            page_state.image_size = None;
+            page_state.rendered_page = None;
+            return;
+        }
+    };
     if page_state.rendered_page == Some(page_idx) {
         return;
     }
@@ -496,15 +849,15 @@ fn render_current_page(
     let page_num = slot.source.page_num;
 
     // Compute target resolution based on current layout
-    let (view_cols, view_rows) = match app.layout_mode {
-        LayoutMode::NoThumbnails => (
-            term_size.width.saturating_sub(14),
-            term_size.height.saturating_sub(3), // status + hints
-        ),
-        _ => (
-            term_size.width.saturating_sub(14),
-            term_size.height.saturating_sub(11), // status + thumbs + hints
-        ),
+    let base_cols = match app.layout_mode {
+        LayoutMode::NoThumbnails => term_size.width.saturating_sub(14),
+        _ => term_size.width.saturating_sub(14),
+    };
+    // In spread view, each page gets half the width
+    let view_cols = if app.spread_mode != crate::app::SpreadMode::Off { base_cols / 2 } else { base_cols };
+    let view_rows = match app.layout_mode {
+        LayoutMode::NoThumbnails => term_size.height.saturating_sub(3), // status + hints
+        _ => term_size.height.saturating_sub(11), // status + thumbs + hints
     };
     let (max_w, max_h) = area_to_pixels(
         Rect::new(0, 0, view_cols, view_rows),
@@ -538,6 +891,91 @@ fn render_current_page(
             page_state.protocol = None;
             page_state.image_size = None;
             page_state.rendered_page = None;
+        }
+    }
+}
+
+/// Render the right (next) page for two-page spread view.
+fn render_spread_page(
+    store: &PdfStore,
+    app: &App,
+    picker: &Picker,
+    page_state: &mut PageViewState,
+    image_cache: &mut ImageCache,
+    term_size: Rect,
+    font_size: (u16, u16),
+) {
+    if app.spread_mode == crate::app::SpreadMode::Off {
+        page_state.protocol_right = None;
+        page_state.image_size_right = None;
+        page_state.rendered_page_right = None;
+        return;
+    }
+
+    let (_, right_page) = app.spread_pages();
+    let right_idx = match right_page {
+        Some(idx) => idx,
+        None => {
+            page_state.protocol_right = None;
+            page_state.image_size_right = None;
+            page_state.rendered_page_right = None;
+            return;
+        }
+    };
+
+    if page_state.rendered_page_right == Some(right_idx) {
+        return;
+    }
+
+    let slot = match app.workspace.pages.get(right_idx) {
+        Some(s) => s,
+        None => return,
+    };
+    let doc_id = slot.source.doc_id;
+    let page_num = slot.source.page_num;
+
+    // Compute target resolution: half the width for spread view
+    let (view_cols, view_rows) = match app.layout_mode {
+        LayoutMode::NoThumbnails => (
+            term_size.width.saturating_sub(14) / 2,
+            term_size.height.saturating_sub(3),
+        ),
+        _ => (
+            term_size.width.saturating_sub(14) / 2,
+            term_size.height.saturating_sub(11),
+        ),
+    };
+    let (max_w, max_h) = area_to_pixels(
+        Rect::new(0, 0, view_cols, view_rows),
+        font_size,
+    );
+
+    if let Some(cached) = image_cache.get(doc_id, page_num, max_w, max_h) {
+        page_state.image_size_right = Some((cached.width(), cached.height()));
+        let proto = picker.new_resize_protocol(cached.clone());
+        page_state.protocol_right = Some(proto);
+        page_state.rendered_page_right = Some(right_idx);
+        return;
+    }
+
+    let pdf = match store.get(doc_id) {
+        Some(p) => p,
+        None => return,
+    };
+
+    let cache = RenderCache::new();
+    match renderer::render_page_with_cache(pdf, page_num, 2.0, Some(max_w), Some(max_h), &cache) {
+        Ok(image) => {
+            page_state.image_size_right = Some((image.width(), image.height()));
+            let proto = picker.new_resize_protocol(image.clone());
+            image_cache.put(doc_id, page_num, max_w, max_h, image);
+            page_state.protocol_right = Some(proto);
+            page_state.rendered_page_right = Some(right_idx);
+        }
+        Err(_) => {
+            page_state.protocol_right = None;
+            page_state.image_size_right = None;
+            page_state.rendered_page_right = None;
         }
     }
 }

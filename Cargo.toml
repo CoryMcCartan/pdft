@@ -10,10 +10,12 @@ crossterm = "0.29"
 hayro = "0.6.0"
 kurbo = "0.13"
 image = "0.25"
-lopdf = "0.36"
+lopdf = "0.40"
 lru = "0.13"
 ratatui = "0.29"
 ratatui-image = { version = "8", features = ["crossterm"] }
+notify = "7"
+notify-debouncer-mini = "0.5"
 
 # Optimize heavy rendering deps even in debug builds
 [profile.dev.package.hayro]
