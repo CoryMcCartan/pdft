@@ -247,18 +247,34 @@ fn run_loop(
     let font_size = picker.font_size();
 
     loop {
+        let sz = terminal.size()?;
+        let term_size = Rect::new(0, 0, sz.width, sz.height);
+
         // Check for file change notifications
         if let Some(rx) = watch_rx {
             if let Ok(path) = rx.try_recv() {
                 // Drain any additional queued notifications
                 while rx.try_recv().is_ok() {}
                 reload_pdf(&path, app, pdf_store, page_state, thumb_state, image_cache);
+                if app.layout_mode != LayoutMode::ThumbnailsOnly {
+                    render_current_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
+                    render_spread_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
+                }
+                if app.view_mode == ViewMode::Text {
+                    extract_current_text(pdf_store, app, page_state, term_size);
+                }
             }
         }
-        let sz = terminal.size()?;
-        let term_size = Rect::new(0, 0, sz.width, sz.height);
 
         terminal.draw(|f| {
+            if app.fullscreen {
+                page_view::render(f, f.area(), app, page_state, font_size);
+                if app.show_help {
+                    help::render(f, f.area());
+                }
+                return;
+            }
+
             let show_main = app.layout_mode != LayoutMode::ThumbnailsOnly;
             let show_thumbs = app.layout_mode != LayoutMode::NoThumbnails;
 
@@ -523,6 +539,7 @@ fn run_loop(
                 let prev_layout = app.layout_mode;
                 let prev_view_mode = app.view_mode;
                 let prev_spread = app.spread_mode;
+                let prev_fullscreen = app.fullscreen;
                 let had_help = app.show_help;
                 let had_dialog = input_dialog.active;
 
@@ -603,9 +620,10 @@ fn run_loop(
 
                 let view_mode_changed = app.view_mode != prev_view_mode;
                 let spread_changed = app.spread_mode != prev_spread;
+                let fullscreen_changed = app.fullscreen != prev_fullscreen;
 
-                // Spread toggle requires full clear and cache invalidation (resolution changes)
-                if spread_changed {
+                // Spread or fullscreen toggle requires full clear and cache invalidation (resolution changes)
+                if spread_changed || fullscreen_changed {
                     page_state.rendered_page = None;
                     page_state.rendered_page_right = None;
                     image_cache.clear();
@@ -619,7 +637,8 @@ fn run_loop(
                     || page_count_changed
                     || state_changed
                     || view_mode_changed
-                    || spread_changed;
+                    || spread_changed
+                    || fullscreen_changed;
 
                 if needs_rerender {
                     // Reset text scroll when page changes
@@ -742,7 +761,6 @@ fn run_loop(
                                 page_state.rendered_page_right = None;
                                 image_cache.clear();
                                 thumb_state.clear();
-                                let _ = terminal.clear();
                                 render_current_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
                                 render_spread_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
                                 app.status_message = Some("Signature placed. Save to keep changes.".into());
@@ -787,7 +805,6 @@ fn run_loop(
                             page_state.rendered_page_right = None;
                             image_cache.clear();
                             thumb_state.clear();
-                            let _ = terminal.clear();
                             render_current_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
                             render_spread_page(pdf_store, app, picker, page_state, image_cache, term_size, font_size);
                             app.status_message = Some("Undone".into());
@@ -838,11 +855,19 @@ fn prefetch_next_page(
     let doc_id = slot.source.doc_id;
     let page_num = slot.source.page_num;
 
-    let base_cols = term_size.width.saturating_sub(14);
+    let base_cols = if app.fullscreen {
+        term_size.width
+    } else {
+        term_size.width.saturating_sub(14)
+    };
     let view_cols = if app.spread_mode != crate::app::SpreadMode::Off { base_cols / 2 } else { base_cols };
-    let view_rows = match app.layout_mode {
-        LayoutMode::NoThumbnails => term_size.height.saturating_sub(3),
-        _ => term_size.height.saturating_sub(11),
+    let view_rows = if app.fullscreen {
+        term_size.height
+    } else {
+        match app.layout_mode {
+            LayoutMode::NoThumbnails => term_size.height.saturating_sub(3),
+            _ => term_size.height.saturating_sub(11),
+        }
     };
     let (max_w, max_h) = area_to_pixels(Rect::new(0, 0, view_cols, view_rows), font_size);
 
@@ -906,15 +931,20 @@ fn render_current_page(
     let page_num = slot.source.page_num;
 
     // Compute target resolution based on current layout
-    let base_cols = match app.layout_mode {
-        LayoutMode::NoThumbnails => term_size.width.saturating_sub(14),
-        _ => term_size.width.saturating_sub(14),
+    let base_cols = if app.fullscreen {
+        term_size.width
+    } else {
+        term_size.width.saturating_sub(14) // subtract sidebar
     };
     // In spread view, each page gets half the width
     let view_cols = if app.spread_mode != crate::app::SpreadMode::Off { base_cols / 2 } else { base_cols };
-    let view_rows = match app.layout_mode {
-        LayoutMode::NoThumbnails => term_size.height.saturating_sub(3), // status + hints
-        _ => term_size.height.saturating_sub(11), // status + thumbs + hints
+    let view_rows = if app.fullscreen {
+        term_size.height
+    } else {
+        match app.layout_mode {
+            LayoutMode::NoThumbnails => term_size.height.saturating_sub(3), // status + hints
+            _ => term_size.height.saturating_sub(11), // status + thumbs + hints
+        }
     };
     let (max_w, max_h) = area_to_pixels(
         Rect::new(0, 0, view_cols, view_rows),

@@ -70,6 +70,62 @@ pub fn handle_key(app: &mut App, key: KeyEvent, dialog: &mut InputDialog) -> boo
         return true;
     }
 
+    // Fullscreen mode: only page navigation and exit
+    if app.fullscreen {
+        match key.code {
+            KeyCode::Char('z') | KeyCode::Esc => {
+                app.fullscreen = false;
+            }
+            KeyCode::Char('q') => {
+                app.should_quit = true;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if app.spread_mode != SpreadMode::Off {
+                    app.next_page();
+                    app.next_page();
+                } else {
+                    app.next_page();
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if app.spread_mode != SpreadMode::Off {
+                    app.prev_page();
+                    app.prev_page();
+                } else {
+                    app.prev_page();
+                }
+            }
+            KeyCode::Char('g') if app.pending_g => {
+                app.workspace.selected_page = 0;
+                app.pending_g = false;
+            }
+            KeyCode::Char('g') => {
+                app.pending_g = true;
+            }
+            KeyCode::Char('G') => {
+                app.workspace.selected_page = app.page_count().saturating_sub(1);
+                app.pending_g = false;
+            }
+            KeyCode::Char(':') => {
+                app.mode = Mode::GotoPage;
+                dialog.title = "Go to".into();
+                dialog.prompt = "Page:".into();
+                dialog.open();
+            }
+            KeyCode::Char('2') => {
+                app.spread_mode = match app.spread_mode {
+                    SpreadMode::Off => SpreadMode::Book,
+                    SpreadMode::Book => SpreadMode::Paired,
+                    SpreadMode::Paired => SpreadMode::Off,
+                };
+            }
+            _ => {
+                app.pending_g = false;
+            }
+        }
+        return true;
+    }
+
     // Form filling mode: Tab/Shift-Tab/Enter/Esc
     if app.mode == Mode::FormFilling {
         match key.code {
@@ -342,6 +398,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent, dialog: &mut InputDialog) -> boo
         }
         KeyCode::Char('w') => {
             app.cycle_layout();
+        }
+        KeyCode::Char('z') => {
+            app.toggle_fullscreen();
         }
         KeyCode::Char('2') => {
             app.spread_mode = match app.spread_mode {

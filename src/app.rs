@@ -139,6 +139,8 @@ pub struct App {
     pub spread_mode: SpreadMode,
     /// Whether file watching is active.
     pub watching: bool,
+    /// Fullscreen mode: hide all chrome, show only the page.
+    pub fullscreen: bool,
 }
 
 impl App {
@@ -175,6 +177,7 @@ impl App {
             form_field_undos: Vec::new(),
             spread_mode: SpreadMode::Off,
             watching: false,
+            fullscreen: false,
         }
     }
 
@@ -249,6 +252,10 @@ impl App {
             ViewMode::Image => ViewMode::Text,
             ViewMode::Text => ViewMode::Image,
         };
+    }
+
+    pub fn toggle_fullscreen(&mut self) {
+        self.fullscreen = !self.fullscreen;
     }
 
     pub fn cycle_layout(&mut self) {

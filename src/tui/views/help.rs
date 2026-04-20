@@ -22,6 +22,7 @@ const BINDINGS: &[(&str, &str)] = &[
     ("[/]", "Prev/next comment"),
     ("t", "Toggle image/text view"),
     ("w", "Cycle layout"),
+    ("z", "Toggle fullscreen"),
     ("2", "Toggle two-page spread"),
     ("A", "Add text to page"),
     ("S", "Place signature (PNG)"),
